@@ -3,13 +3,18 @@
         "acodec",
         "analysing",
         "bestaudio",
+        "cookiefile",
+        "cookiesfrombrowser",
         "Gyan",
+        "ignoreerrors",
         "noplaylist",
         "outtmpl",
         "postprocessors",
         "preferredcodec",
         "preferredquality",
+        "pycache",
         "vcodec",
+        "venv",
         "windowsfilenames",
         "winget"
     ]

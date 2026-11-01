@@ -2,15 +2,18 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from yt_dlp import YoutubeDL
-from yt_dlp.utils import DownloadError
+from yt_dlp.utils import YoutubeDLError, DownloadCancelled         
 
 from .errors import (
+    CookieProblemError,
     DownloadFailedError,
     FFmpegMissingError,
     InvalidUrlError,
     MediaUnavailableError,
+    UserCancelledError,
+    VerificationRequiredError,
 )
-from .models import DownloadRequest, DownloadResult, MediaInfo, Mode, Progress
+from .models import CookieSettings, DownloadRequest, DownloadResult, MediaInfo, Mode, Progress
 from .tools import find_tool
 
 
@@ -24,7 +27,7 @@ def validate_url(url):
 
 
 def _translate_error(error):
-    """Turn yt-dlp's DownloadError into one of OUR errors, by reading its message.
+    """Turn a yt-dlp error into one of OUR errors, by reading its message.
     This is a best-effort guess: unknown messages become DownloadFailedError."""
     message = str(error).replace("ERROR: ", "", 1)
     lowered = message.lower()
@@ -32,9 +35,25 @@ def _translate_error(error):
     if "unsupported url" in lowered:
         return InvalidUrlError("This link or website isn't supported.")
 
+    # Check this BEFORE the cookie check: YouTube's own message mentions "cookies"
+    if "not a bot" in lowered:
+        return VerificationRequiredError(
+            "YouTube is asking to verify that you're not a bot.\n\n"
+            "Fix: under 'Cookies', choose a browser where you are signed in to YouTube "
+            "(Firefox works best on Windows) or a cookies.txt file, then try again."
+        )
+
+    cookie_trouble = ("could not copy", "decrypt", "database", "failed to", "not found")
+    if "cookie" in lowered and any(word in lowered for word in cookie_trouble):
+        return CookieProblemError(
+            "Couldn't read the cookies. Close that browser completely and try again.\n"
+            "On Windows, Chrome and Edge often block this: Firefox or a cookies.txt "
+            f"file works better.\n\nDetails: {message}"
+        )
+
     unavailable_markers = (
         "private video", "video unavailable", "not available",
-        "has been removed", "sign in to confirm", "members-only",
+        "has been removed", "members-only", "confirm your age",
     )
     if any(marker in lowered for marker in unavailable_markers):
         return MediaUnavailableError(message)
@@ -58,13 +77,23 @@ def _final_paths(info):
 
 class Downloader:
     """Our own simple interface on top of yt-dlp.
-    The rest of the app talks to this class and never imports yt_dlp directly."""
+    The rest of the app talks to THIS class and never imports yt_dlp directly."""
 
-    def __init__(self):
-        self.ffmpeg = find_tool("ffmpeg")        # full path, or None
+    def __init__(self, cookies=None):
+        self.ffmpeg = find_tool("ffmpeg")              # full path, or None
+        self.cookies = cookies or CookieSettings()     # the UI may replace this any time
 
+    def _apply_cookies(self, options):
+        """Add the cookie settings (if any) to a yt-dlp options dictionary."""
+        if self.cookies.file:
+            options["cookiefile"] = str(self.cookies.file)
+        elif self.cookies.browser:
+            # yt-dlp expects a tuple here: (browser name,)
+            options["cookiesfrombrowser"] = (self.cookies.browser,)
 
-    # 1) Look at a link without downloading it 
+    
+    # 1) Look at a link without downloading it
+    
     def fetch_info(self, url, playlist=False):
         url = validate_url(url)
 
@@ -72,15 +101,15 @@ class Downloader:
             "quiet": True,
             "no_warnings": True,
             "noplaylist": not playlist,
+            # "flat" = list a playlist's entries without analysing every video (fast)
+            "extract_flat": "in_playlist",
         }
-        if playlist:
-            # "flat" = list the entries only, without analysing every video
-            options["extract_flat"] = "in_playlist"
+        self._apply_cookies(options)
 
         try:
             with YoutubeDL(options) as ydl:
                 info = ydl.extract_info(url, download=False)
-        except DownloadError as e:
+        except YoutubeDLError as e:
             raise _translate_error(e) from e
 
         return self._to_media_info(url, info)
@@ -111,12 +140,14 @@ class Downloader:
             heights=heights,
         )
 
-
+    
     # 2) Download
-    def download(self, request, on_progress=None):
+    
+    def download(self, request, on_progress=None, cancel_event=None):
         """Download according to `request`.
-        on_progress is optional: a function that receives Progress objects.
-        (A function passed to another function is called a callback.)"""
+        on_progress  : OPTIONAL function that receives Progress objects (a callback).
+        cancel_event : OPTIONAL threading.Event. Another thread calls .set() on it
+                       to ask us to stop."""
         url = validate_url(request.url)
 
         if not self.ffmpeg:
@@ -126,16 +157,24 @@ class Downloader:
             )
 
         def hook(d):
-            # yt-dlp calls this many times per second with a dict called d
+            # yt-dlp calls this many times per second with a dict called d.
+
+            # 1) Cancel check FIRST. Raising here makes yt-dlp stop right away.
+            if cancel_event is not None and cancel_event.is_set():
+                raise DownloadCancelled()
+
             if on_progress is None:
                 return
+
+            # 2) Report progress
             if d.get("status") == "downloading":
                 total = d.get("total_bytes") or d.get("total_bytes_estimate")
                 done = d.get("downloaded_bytes") or 0
                 percent = done / total * 100 if total else 0.0
+                item_index = (d.get("info_dict") or {}).get("playlist_index")
                 on_progress(Progress(
                     "downloading", percent, d.get("speed"), d.get("eta"),
-                    d.get("filename", ""),
+                    d.get("filename", ""), item_index,
                 ))
             elif d.get("status") == "finished":
                 # One file finished downloading; merging/converting comes next
@@ -145,7 +184,9 @@ class Downloader:
             options = self._build_options(request, hook)
             with YoutubeDL(options) as ydl:
                 info = ydl.extract_info(url, download=True)
-        except DownloadError as e:
+        except DownloadCancelled as e:               # must come BEFORE YoutubeDLError
+            raise UserCancelledError("Download cancelled.") from e
+        except YoutubeDLError as e:
             raise _translate_error(e) from e
         except OSError as e:
             raise DownloadFailedError(f"File problem: {e}") from e
@@ -191,4 +232,9 @@ class Downloader:
             options["format_sort"] = ["vcodec:h264", "res", "acodec:m4a"]
             options["merge_output_format"] = "mp4"
 
+        if request.playlist:
+            # Skip a broken item instead of stopping the whole playlist
+            options["ignoreerrors"] = "only_download"
+
+        self._apply_cookies(options)
         return options

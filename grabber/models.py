@@ -44,8 +44,16 @@ class Progress:
     speed: float | None                  # bytes per second
     eta: int | None                      # seconds left
     filename: str
+    item_index: int | None = None        # position inside a playlist (1, 2, 3...), else None
 
 
 @dataclass(frozen=True)
 class DownloadResult:
     files: tuple[Path, ...]
+
+
+@dataclass(frozen=True)
+class CookieSettings:
+    """Where to take login cookies from (YouTube sometimes demands them)."""
+    browser: str | None = None       # "firefox", "edge", "chrome", "brave", or None
+    file: Path | None = None         # a cookies.txt file (it wins over the browser)

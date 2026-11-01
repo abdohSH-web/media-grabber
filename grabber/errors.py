@@ -17,3 +17,19 @@ class FFmpegMissingError(GrabberError):
 
 class DownloadFailedError(GrabberError):
     """Any other failure. The message keeps the original reason."""
+
+
+class VerificationRequiredError(GrabberError):
+    """The site wants proof you're a real user (YouTube's "confirm you're not a bot")."""
+
+
+class CookieProblemError(GrabberError):
+    """Browser cookies were requested but couldn't be read."""
+
+
+class UserCancelledError(GrabberError):
+    """The user pressed Cancel. Not a failure: the UI shows no warning for it."""
+
+
+class UserCancelledError(GrabberError):
+    """The user pressed Cancel. Not a failure: the UI shows no warning for it."""
