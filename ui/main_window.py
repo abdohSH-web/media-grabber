@@ -1,3 +1,4 @@
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -31,6 +32,8 @@ from grabber.errors import HistoryError
 from grabber.history import HistoryEntry, HistoryStore
 from grabber.jobs import DownloadQueue, JobState
 from grabber.models import CookieSettings, DownloadRequest, Mode
+from grabber.tools import find_tool
+from grabber.updates import installed_version, is_newer, latest_version
 
 from .formatting import format_duration, format_eta, format_speed
 from .playlist_dialog import PlaylistDialog
@@ -99,6 +102,7 @@ class MainWindow(QMainWindow):
         self.load_cookie_settings()
         self.refresh_history_table()
         self.update_buttons()
+        self.check_tools()
 
         # Restore the window size and position from the last run
         geometry = self.settings.value("window/geometry")
@@ -119,6 +123,12 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(page)             # stacks things top to bottom
         layout.setSpacing(12)
         layout.setContentsMargins(20, 20, 20, 20)
+        # A warning banner: only visible when FFmpeg or Deno is missing
+        self.tools_label = QLabel("")
+        self.tools_label.setWordWrap(True)
+        self.tools_label.setStyleSheet("color: #f0b429;")
+        self.tools_label.setVisible(False)
+        layout.addWidget(self.tools_label)
 
         # --- Row 1: the link + Paste + Fetch buttons ---
         link_row = QHBoxLayout()               # places things side by side
@@ -240,8 +250,17 @@ class MainWindow(QMainWindow):
             queue_buttons.addWidget(button)
         layout.addLayout(queue_buttons)
 
+        # --- Footer: status on the left, yt-dlp version + update check on the right ---
+        footer = QHBoxLayout()
         self.status_label = QLabel("Ready")
-        layout.addWidget(self.status_label)
+        self.version_label = QLabel(f"yt-dlp {installed_version()}")
+        self.version_label.setStyleSheet("color: #9a9da3;")
+        self.update_button = QPushButton("Check for updates")
+        self.update_button.clicked.connect(self.on_update_clicked)
+        footer.addWidget(self.status_label, stretch=1)
+        footer.addWidget(self.version_label)
+        footer.addWidget(self.update_button)
+        layout.addLayout(footer)
         return page
 
     def build_history_tab(self):
@@ -457,8 +476,56 @@ class MainWindow(QMainWindow):
         """Qt calls this when the window is closing: save its size and position."""
         self.settings.setValue("window/geometry", self.saveGeometry())
         super().closeEvent(event)
+    # ============================================================
+    # Tools check and yt-dlp updates
+    # ============================================================
+    def check_tools(self):
+        """Show a warning banner if a tool we depend on is missing."""
+        problems = []
+        if not find_tool("ffmpeg"):
+            problems.append(
+                "⚠ FFmpeg wasn't found, so downloads won't work. "
+                "Install it with:  winget install Gyan.FFmpeg  and restart the app."
+            )
+        if not find_tool("deno"):
+            problems.append(
+                "⚠ Deno wasn't found: some YouTube formats may be missing. "
+                "Install it with:  winget install DenoLand.Deno  and restart the app."
+            )
+        self.tools_label.setText("\n".join(problems))
+        self.tools_label.setVisible(bool(problems))
 
+    def on_update_clicked(self):
+        self.update_button.setEnabled(False)
+        self.status_label.setText("Checking for a newer yt-dlp...")
 
+        worker = Worker(latest_version)          # runs in the background: it uses the internet
+        worker.signals.finished.connect(self.on_update_checked)
+        self.update_worker = worker              # keep a reference
+        self.pool.start(worker)
+
+    def on_update_checked(self, latest):
+        self.update_button.setEnabled(True)
+        current = installed_version()
+
+        if latest is None:
+            self.status_label.setText("Couldn't check for updates (no internet?).")
+            return
+        if not is_newer(latest, current):
+            self.status_label.setText(f"yt-dlp is up to date ({current}).")
+            return
+
+        if getattr(sys, "frozen", False):        # the packaged .exe
+            how = "Rebuild the app with build.ps1: it installs the newest yt-dlp first."
+        else:                                    # running from source
+            how = 'Update it with:  pip install -U "yt-dlp[default]"'
+        QMessageBox.information(
+            self, "Media Grabber",
+            f"A newer yt-dlp is available: {latest} (you have {current}).\n\n{how}",
+        )
+        self.status_label.setText(f"Update available: yt-dlp {latest}")
+
+        
     # ============================================================
     # Step B: the queue
     # ============================================================

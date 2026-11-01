@@ -4,3 +4,6 @@ downloads/
 *.log
 cookies.txt
 *cookies*.txt
+build/
+dist/
+*.spec
