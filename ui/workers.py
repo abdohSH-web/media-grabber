@@ -61,3 +61,9 @@ def load_thumbnail(url):
             return response.read()
     except Exception:
         return None
+
+class QueueBridge(QObject):
+    """The queue runs in a plain Python thread and knows nothing about Qt.
+    This tiny object turns its callback into a Qt signal, which Qt delivers
+    safely in the main thread."""
+    changed = Signal(object)

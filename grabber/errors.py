@@ -33,3 +33,7 @@ class UserCancelledError(GrabberError):
 
 class UserCancelledError(GrabberError):
     """The user pressed Cancel. Not a failure: the UI shows no warning for it."""
+
+
+class HistoryError(GrabberError):
+    """The download history couldn't be saved."""

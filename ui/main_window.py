@@ -1,13 +1,15 @@
-import threading
+from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, Qt, QThreadPool, QUrl
+from PySide6.QtCore import QSettings, QStandardPaths, Qt, QThreadPool, QUrl
 from PySide6.QtGui import QDesktopServices, QPixmap
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QCheckBox,
     QComboBox,
     QFileDialog,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -15,37 +17,67 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QRadioButton,
+    QTableWidget,
+    QTableWidgetItem,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
 from grabber.downloader import Downloader
+from grabber.errors import HistoryError
+from grabber.history import HistoryEntry, HistoryStore
+from grabber.jobs import DownloadQueue, JobState
 from grabber.models import CookieSettings, DownloadRequest, Mode
 
 from .formatting import format_duration, format_eta, format_speed
-from .workers import Worker, load_thumbnail
+from .workers import QueueBridge, Worker, load_thumbnail
 
 # Quality choices offered for playlists (each video has its own list of heights)
 PRESET_HEIGHTS = (1080, 720, 480, 360)
+
+# What the Status column shows for states that need no extra details
+STATE_LABELS = {
+    JobState.PENDING: "Waiting",
+    JobState.PAUSED: "Paused",
+    JobState.DONE: "Done",
+    JobState.FAILED: "Failed",
+    JobState.CANCELLED: "Cancelled",
+}
+
+
+def make_table(headers):
+    """A read-only table whose rows are selected as a whole. Used twice."""
+    table = QTableWidget(0, len(headers))
+    table.setHorizontalHeaderLabels(headers)
+    table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+    table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+    table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+    table.verticalHeader().setVisible(False)
+    return table
 
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Media Grabber")
-        self.resize(680, 580)
+        self.resize(800, 780)
 
         self.downloader = Downloader()
-        self.pool = QThreadPool.globalInstance()   # Qt's ready-made thread pool
-
+        self.pool = QThreadPool.globalInstance()   # used for fetching info
         self.info = None              # MediaInfo of the last fetched link (None = nothing ready)
-        self.last_folder = None
-        self.fetch_worker = None      # we keep references so Python doesn't delete them
-        self.download_worker = None
-        self.cancel_event = None      # a threading.Event shared with the download thread
-        self.current_request = None   # the request being downloaded right now
-        self.paused_request = None    # the request waiting to be resumed (None = not paused)
-        self.stop_reason = None       # "pause", "cancel", or None
+        self.fetch_worker = None      # we keep a reference so Python doesn't delete it
+
+        # The queue runs in its own Python thread. The bridge hands its updates to Qt safely.
+        self.bridge = QueueBridge()
+        self.bridge.changed.connect(self.on_job_changed)
+        self.queue = DownloadQueue(self.downloader, on_change=self.bridge.changed.emit)
+
+        # The history file lives in the app's data folder (on Windows: inside AppData)
+        data_dir = Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation))
+        self.history = HistoryStore(data_dir / "history.json")
+        self.history_entries = []     # what the History table currently shows
+        self.recorded = set()         # ids of jobs already written to the history
 
         # QSettings remembers small settings between runs (on Windows: in the registry)
         self.settings = QSettings("MediaGrabber", "MediaGrabber")
@@ -53,14 +85,21 @@ class MainWindow(QMainWindow):
 
         self.build_ui()
         self.load_cookie_settings()
+        self.refresh_history_table()
+        self.update_buttons()
 
-    
+    # ============================================================
     # Building the window
-    
+    # ============================================================
     def build_ui(self):
-        central = QWidget()
-        self.setCentralWidget(central)
-        layout = QVBoxLayout(central)          # stacks things top to bottom
+        self.tabs = QTabWidget()
+        self.setCentralWidget(self.tabs)
+        self.tabs.addTab(self.build_downloads_tab(), "Downloads")
+        self.tabs.addTab(self.build_history_tab(), "History")
+
+    def build_downloads_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)             # stacks things top to bottom
         layout.setSpacing(12)
         layout.setContentsMargins(20, 20, 20, 20)
 
@@ -124,7 +163,7 @@ class MainWindow(QMainWindow):
         folder_row.addWidget(browse_button)
         layout.addLayout(folder_row)
 
-        # --- Row 4b: cookies (needed when YouTube asks you to prove you're not a bot) ---
+        # --- Row 5: cookies (needed when YouTube asks you to prove you're not a bot) ---
         cookies_row = QHBoxLayout()
         self.cookie_box = QComboBox()
         self.cookie_box.setToolTip(
@@ -145,47 +184,75 @@ class MainWindow(QMainWindow):
         cookies_row.addWidget(self.cookie_file_label, stretch=1)
         layout.addLayout(cookies_row)
 
-        # --- Row 5: action buttons ---
-        buttons_row = QHBoxLayout()
-        self.download_button = QPushButton("Download")
-        self.download_button.setEnabled(False)          # nothing to download yet
-        self.download_button.clicked.connect(self.on_download_clicked)
+        # --- Row 6: add to the queue ---
+        self.add_button = QPushButton("Add to queue")
+        self.add_button.setEnabled(False)              # nothing fetched yet
+        self.add_button.clicked.connect(self.on_add_clicked)
+        layout.addWidget(self.add_button)
+
+        # --- The queue table ---
+        layout.addWidget(QLabel("Queue"))
+        self.table = make_table(["Title", "Status", "Progress"])
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        self.table.setColumnWidth(2, 170)
+        self.table.itemSelectionChanged.connect(self.update_buttons)
+        layout.addWidget(self.table, stretch=1)
+
+        queue_buttons = QHBoxLayout()
         self.pause_button = QPushButton("Pause")
-        self.pause_button.setEnabled(False)             # only while a download runs
         self.pause_button.clicked.connect(self.on_pause_clicked)
         self.cancel_button = QPushButton("Cancel")
-        self.cancel_button.setEnabled(False)            # only while a download runs
         self.cancel_button.clicked.connect(self.on_cancel_clicked)
         self.open_button = QPushButton("Open folder")
-        self.open_button.setEnabled(False)
-        self.open_button.clicked.connect(self.open_folder)
-        buttons_row.addWidget(self.download_button, stretch=1)
-        buttons_row.addWidget(self.pause_button)
-        buttons_row.addWidget(self.cancel_button)
-        buttons_row.addWidget(self.open_button)
-        layout.addLayout(buttons_row)
+        self.open_button.clicked.connect(self.open_job_folder)
+        self.clear_button = QPushButton("Clear finished")
+        self.clear_button.clicked.connect(self.on_clear_clicked)
+        for button in (self.pause_button, self.cancel_button, self.open_button, self.clear_button):
+            queue_buttons.addWidget(button)
+        layout.addLayout(queue_buttons)
 
-        # --- Row 6: progress + status ---
-        self.progress = QProgressBar()
-        self.progress.setRange(0, 100)
-        self.progress.setValue(0)
         self.status_label = QLabel("Ready")
-        layout.addWidget(self.progress)
         layout.addWidget(self.status_label)
-        layout.addStretch()
+        return page
 
-    
+    def build_history_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setSpacing(12)
+        layout.setContentsMargins(20, 20, 20, 20)
+
+        self.history_table = make_table(["Finished", "Title", "Type", "Quality"])
+        header = self.history_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.history_table.itemSelectionChanged.connect(self.update_history_buttons)
+        layout.addWidget(self.history_table, stretch=1)
+
+        buttons = QHBoxLayout()
+        self.history_open_button = QPushButton("Open folder")
+        self.history_open_button.clicked.connect(self.on_history_open_clicked)
+        self.history_again_button = QPushButton("Download again")
+        self.history_again_button.clicked.connect(self.on_history_again_clicked)
+        self.history_clear_button = QPushButton("Clear history")
+        self.history_clear_button.clicked.connect(self.on_history_clear_clicked)
+        for button in (self.history_open_button, self.history_again_button, self.history_clear_button):
+            buttons.addWidget(button)
+        layout.addLayout(buttons)
+        return page
+
+    # ============================================================
     # Small helpers
-    
+    # ============================================================
     def set_busy(self, busy, message):
-        """Lock or unlock the buttons, and show a status message."""
+        """Used while FETCHING: lock the buttons and show a status message."""
         self.fetch_button.setEnabled(not busy)
-        self.download_button.setEnabled(not busy and self.info is not None)
+        self.add_button.setEnabled(not busy and self.info is not None)
         self.status_label.setText(message)
-
-    def reset_progress(self):
-        self.progress.setRange(0, 100)
-        self.progress.setValue(0)
 
     def update_options(self, *_):
         # Quality only makes sense for video
@@ -224,13 +291,13 @@ class MainWindow(QMainWindow):
         if folder:                                       # empty string = user cancelled
             self.folder_edit.setText(folder)
 
-    def open_folder(self):
-        if self.last_folder:
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.last_folder)))
+    @staticmethod
+    def open_in_explorer(folder):
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
 
-    
+    # ============================================================
     # Cookies setting
-    
+    # ============================================================
     def current_cookie_settings(self):
         choice = self.cookie_box.currentData()
         if choice == "file":
@@ -277,9 +344,9 @@ class MainWindow(QMainWindow):
             self.cookie_file_label.setText(self.cookie_file.name)
         self.downloader.cookies = self.current_cookie_settings()
 
-    
+    # ============================================================
     # Step A: fetch info
-    
+    # ============================================================
     def on_fetch_clicked(self):
         url = self.url_edit.text().strip()
         if not url:
@@ -293,7 +360,7 @@ class MainWindow(QMainWindow):
 
         worker = Worker(self.fetch_job, url, self.playlist_check.isChecked())
         worker.signals.finished.connect(self.on_fetched)
-        worker.signals.failed.connect(self.on_failed)
+        worker.signals.failed.connect(self.on_fetch_failed)
         self.fetch_worker = worker             # keep a reference
         self.pool.start(worker)
 
@@ -312,16 +379,21 @@ class MainWindow(QMainWindow):
 
         if info.is_playlist:
             self.fill_qualities(PRESET_HEIGHTS)
-            message = f"Playlist with {info.entry_count} items. Choose your options and press Download."
+            message = f"Playlist with {info.entry_count} items. Choose your options and add it to the queue."
         else:
             self.fill_qualities(info.heights)
-            message = "Ready. Choose your options and press Download."
+            message = "Ready. Choose your options and add it to the queue."
         self.set_busy(False, message)
 
-    
-    # Step B: download (with pause / resume / cancel)
-    
-    def on_download_clicked(self):
+    def on_fetch_failed(self, message):
+        self.title_label.setText("Paste a link and press Fetch")
+        self.set_busy(False, "Something went wrong.")
+        QMessageBox.warning(self, "Media Grabber", message)
+
+    # ============================================================
+    # Step B: the queue
+    # ============================================================
+    def on_add_clicked(self):
         request = DownloadRequest(
             url=self.info.url,
             folder=Path(self.folder_edit.text()),
@@ -329,140 +401,199 @@ class MainWindow(QMainWindow):
             max_height=self.quality_box.currentData(),     # the hidden value (or None)
             playlist=self.info.is_playlist,
         )
-        self.last_folder = request.folder
-        self.open_button.setEnabled(False)
-        self.reset_progress()
-        self.start_download(request)
+        self.queue.add(request, self.info.title, item_count=self.info.entry_count)
+        self.status_label.setText("Added to the queue.")
 
-    def start_download(self, request):
-        """Start a download, or RESTART one after a pause."""
-        self.current_request = request
-        self.paused_request = None
-        self.stop_reason = None
+    def selected_job(self):
+        """The job of the selected row, or None. Row N is always queue.jobs[N]."""
+        row = self.table.currentRow()
+        if 0 <= row < len(self.queue.jobs):
+            return self.queue.jobs[row]
+        return None
 
-        self.set_busy(True, "Starting...")
-        self.pause_button.setText("Pause")
-        self.pause_button.setEnabled(True)
-        self.cancel_button.setEnabled(True)
+    def update_buttons(self):
+        job = self.selected_job()
+        state = job.state if job else None
 
-        # A fresh "flag" for this run. Pause and Cancel raise it,
-        # and the download thread checks it many times per second.
-        self.cancel_event = threading.Event()
-
-        worker = Worker(
-            self.downloader.download, request,
-            with_progress=True, cancel_event=self.cancel_event,
+        can_resume = state is JobState.PAUSED
+        can_pause = state in (JobState.DOWNLOADING, JobState.PENDING)
+        self.pause_button.setText("Resume" if can_resume else "Pause")
+        self.pause_button.setEnabled(can_pause or can_resume)
+        self.cancel_button.setEnabled(
+            state in (JobState.PENDING, JobState.DOWNLOADING, JobState.PAUSED)
         )
-        worker.signals.progress.connect(self.on_progress)
-        worker.signals.finished.connect(self.on_download_done)
-        worker.signals.cancelled.connect(self.on_cancelled)
-        worker.signals.failed.connect(self.on_failed)
-        self.download_worker = worker
-        self.pool.start(worker)
+        self.open_button.setEnabled(job is not None)
 
     def on_pause_clicked(self):
-        # The same button does two jobs, depending on the current state
-        if self.paused_request is not None:
-            self.start_download(self.paused_request)       # "Resume"
+        job = self.selected_job()
+        if job is None:
             return
-
-        if self.cancel_event is not None:                  # "Pause"
-            self.stop_reason = "pause"
-            self.cancel_event.set()
-            self.pause_button.setEnabled(False)
-            self.cancel_button.setEnabled(False)
-            self.status_label.setText("Pausing...")
+        if job.state is JobState.PAUSED:
+            self.queue.resume(job)
+        else:
+            self.queue.pause(job)
 
     def on_cancel_clicked(self):
-        if self.paused_request is not None:
-            # Cancelling while paused: just forget the paused download
-            self.paused_request = None
-            self.pause_button.setText("Pause")
-            self.pause_button.setEnabled(False)
-            self.cancel_button.setEnabled(False)
-            self.reset_progress()
-            self.set_busy(False, "Cancelled. Unfinished .part files may remain in the folder.")
+        job = self.selected_job()
+        if job is not None:
+            self.queue.cancel(job)
+
+    def open_job_folder(self):
+        job = self.selected_job()
+        if job is not None:
+            self.open_in_explorer(job.request.folder)
+
+    def on_clear_clicked(self):
+        self.queue.clear_finished()
+        self.rebuild_table()
+
+    # ---------- keeping the table in sync with the queue ----------
+    def on_job_changed(self, job):
+        """Runs in the MAIN thread, every time the queue reports a change."""
+        self.update_row(job)
+        self.update_buttons()
+
+        # A finished job is written to the history exactly once
+        if job.state is JobState.DONE and job.id not in self.recorded:
+            self.recorded.add(job.id)
+            self.record_history(job)
+
+    def ensure_row(self, row):
+        """Make sure the table has a row number `row` (with its progress bar)."""
+        while self.table.rowCount() <= row:
+            new_row = self.table.rowCount()
+            self.table.insertRow(new_row)
+            self.table.setItem(new_row, 0, QTableWidgetItem(""))
+            self.table.setItem(new_row, 1, QTableWidgetItem(""))
+            bar = QProgressBar()
+            bar.setRange(0, 100)
+            self.table.setCellWidget(new_row, 2, bar)
+
+    def update_row(self, job):
+        try:
+            row = self.queue.jobs.index(job)
+        except ValueError:
+            return                              # the job was cleared meanwhile
+        self.ensure_row(row)
+
+        self.table.item(row, 0).setText(job.title)
+        status_item = self.table.item(row, 1)
+        status_item.setText(self.status_text(job))
+        status_item.setToolTip(job.message if job.state is JobState.FAILED else "")
+        self.table.cellWidget(row, 2).setValue(int(self.job_percent(job)))
+
+    def rebuild_table(self):
+        self.table.setRowCount(0)
+        for job in list(self.queue.jobs):
+            self.update_row(job)
+        self.update_buttons()
+
+    @staticmethod
+    def status_text(job):
+        if job.state is not JobState.DOWNLOADING:
+            return STATE_LABELS[job.state]
+
+        p = job.progress
+        if p is None:
+            return "Starting..."
+        if p.status == "processing":
+            return "Processing..."
+
+        parts = ["Downloading"]
+        if job.item_count > 1 and p.item_index:
+            parts = [f"Item {p.item_index}/{job.item_count}"]
+        if p.speed:
+            parts.append(format_speed(p.speed))
+        if p.eta is not None:
+            parts.append(f"{format_eta(p.eta)} left")
+        return "  •  ".join(parts)
+
+    @staticmethod
+    def job_percent(job):
+        if job.state is JobState.DONE:
+            return 100
+        p = job.progress
+        if p is None:
+            return 0
+        if job.item_count > 1 and p.item_index:
+            # Overall progress = finished items + the fraction of the current one
+            return ((p.item_index - 1) + p.percent / 100) / job.item_count * 100
+        return p.percent
+
+    # ============================================================
+    # History
+    # ============================================================
+    def record_history(self, job):
+        entry = HistoryEntry(
+            title=job.title,
+            url=job.request.url,
+            mode=job.request.mode.value,
+            max_height=job.request.max_height,
+            playlist=job.request.playlist,
+            folder=str(job.request.folder),
+            finished_at=datetime.now().isoformat(timespec="seconds"),
+            file_count=len(job.files),
+        )
+        try:
+            self.history.add(entry)
+        except HistoryError as e:
+            self.status_label.setText(f"Couldn't save the history: {e}")
+        self.refresh_history_table()
+
+    def refresh_history_table(self):
+        self.history_entries = self.history.load()          # newest first
+        self.history_table.setRowCount(len(self.history_entries))
+
+        for row, entry in enumerate(self.history_entries):
+            if entry.mode == "audio":
+                quality = "MP3"
+            else:
+                quality = f"Up to {entry.max_height}p" if entry.max_height else "Best"
+            kind = entry.mode.capitalize() + ("  •  playlist" if entry.playlist else "")
+            cells = (entry.finished_at.replace("T", " "), entry.title, kind, quality)
+            for column, text in enumerate(cells):
+                self.history_table.setItem(row, column, QTableWidgetItem(text))
+        self.update_history_buttons()
+
+    def selected_history_entry(self):
+        row = self.history_table.currentRow()
+        if 0 <= row < len(self.history_entries):
+            return self.history_entries[row]
+        return None
+
+    def update_history_buttons(self):
+        selected = self.selected_history_entry() is not None
+        self.history_open_button.setEnabled(selected)
+        self.history_again_button.setEnabled(selected)
+        self.history_clear_button.setEnabled(bool(self.history_entries))
+
+    def on_history_open_clicked(self):
+        entry = self.selected_history_entry()
+        if entry is not None:
+            self.open_in_explorer(entry.folder)
+
+    def on_history_again_clicked(self):
+        entry = self.selected_history_entry()
+        if entry is None:
             return
+        request = DownloadRequest(
+            url=entry.url,
+            folder=Path(entry.folder),
+            mode=Mode(entry.mode),                 # "video" -> Mode.VIDEO
+            max_height=entry.max_height,
+            playlist=entry.playlist,
+        )
+        item_count = entry.file_count if entry.playlist else 1
+        self.queue.add(request, entry.title, item_count=item_count)
+        self.tabs.setCurrentIndex(0)               # jump to the Downloads tab
+        self.status_label.setText("Added to the queue.")
 
-        if self.cancel_event is not None:
-            self.stop_reason = "cancel"
-            self.cancel_event.set()
-            self.pause_button.setEnabled(False)
-            self.cancel_button.setEnabled(False)
-            self.status_label.setText("Cancelling...")
-
-    def on_progress(self, p):
-        if p.status == "downloading":
-            # Progress signals may still arrive just after we asked to stop
-            if self.stop_reason is None:
-                self.pause_button.setEnabled(True)
-                self.cancel_button.setEnabled(True)
-
-            percent = p.percent
-            prefix = ""
-            if self.info and self.info.is_playlist and p.item_index:
-                count = self.info.entry_count
-                # Overall progress = finished items + the fraction of the current one
-                percent = ((p.item_index - 1) + p.percent / 100) / count * 100
-                prefix = f"Item {p.item_index}/{count}  •  "
-
-            self.progress.setRange(0, 100)
-            self.progress.setValue(int(percent))
-            parts = [f"{prefix}Downloading {p.percent:.0f}%"]
-            if p.speed:
-                parts.append(format_speed(p.speed))
-            if p.eta is not None:
-                parts.append(f"{format_eta(p.eta)} left")
-            self.status_label.setText("  •  ".join(parts))
-
-        elif p.status == "processing":
-            # FFmpeg's merge can't be stopped half-way, so lock both buttons for now
-            self.pause_button.setEnabled(False)
-            self.cancel_button.setEnabled(False)
-            self.progress.setRange(0, 0)       # (0, 0) = a bar that just moves: "working..."
-            self.status_label.setText("Processing (merging / converting)...")
-
-    def on_download_done(self, result):
-        saved = len(result.files)
-        message = f"Done. {saved} file(s) saved."
-        if self.info and self.info.is_playlist and saved < self.info.entry_count:
-            message += f" {self.info.entry_count - saved} item(s) were skipped."
-
-        self.stop_reason = None
-        self.progress.setRange(0, 100)
-        self.progress.setValue(100)
-        self.pause_button.setText("Pause")
-        self.pause_button.setEnabled(False)
-        self.cancel_button.setEnabled(False)
-        self.set_busy(False, message)
-        self.open_button.setEnabled(True)
-
-    def on_cancelled(self):
-        """The download thread stopped because we asked it to (pause OR cancel)."""
-        if self.stop_reason == "pause":
-            self.paused_request = self.current_request
-            self.pause_button.setText("Resume")
-            self.pause_button.setEnabled(True)
-            self.cancel_button.setEnabled(True)    # lets the user discard the paused download
-            # We do NOT call set_busy(False): Fetch and Download stay locked while paused
-            self.status_label.setText("Paused. Press Resume to continue.")
+    def on_history_clear_clicked(self):
+        answer = QMessageBox.question(self, "Media Grabber", "Clear the whole download history?")
+        if answer != QMessageBox.StandardButton.Yes:
             return
-
-        self.reset_progress()
-        self.pause_button.setEnabled(False)
-        self.cancel_button.setEnabled(False)
-        self.set_busy(False, "Cancelled. Unfinished .part files may remain in the folder.")
-
-    
-    # Errors (from either worker)
-    
-    def on_failed(self, message):
-        self.stop_reason = None
-        self.paused_request = None
-        self.reset_progress()
-        self.pause_button.setText("Pause")
-        self.pause_button.setEnabled(False)
-        self.cancel_button.setEnabled(False)
-        self.title_label.setText(self.info.title if self.info else "Paste a link and press Fetch")
-        self.set_busy(False, "Something went wrong.")
-        QMessageBox.warning(self, "Media Grabber", message)
+        try:
+            self.history.clear()
+        except HistoryError as e:
+            QMessageBox.warning(self, "Media Grabber", str(e))
+        self.refresh_history_table()

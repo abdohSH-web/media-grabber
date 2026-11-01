@@ -22,17 +22,17 @@ class DownloadJob:
 
     _ids = itertools.count(1)          # one counter shared by all jobs: 1, 2, 3...
 
-    def __init__(self, request, title):
+    def __init__(self, request, title, item_count=1):
         self.id = next(DownloadJob._ids)
         self.request = request
         self.title = title
+        self.item_count = item_count   # how many videos (more than 1 for a playlist)
         self.state = JobState.PENDING
         self.progress = None           # the latest Progress object (or None)
         self.message = ""              # error text or a short note
         self.files = ()                # filled when the job is DONE
         self._stop_event = threading.Event()
         self._stop_reason = None       # "pause" or "cancel"
-
 
 class DownloadQueue:
     """Runs jobs ONE AT A TIME in a background thread.
@@ -54,8 +54,8 @@ class DownloadQueue:
     # ------------------------------------------------------------
     # Commands (called by the UI, from any thread)
     # ------------------------------------------------------------
-    def add(self, request, title):
-        job = DownloadJob(request, title)
+    def add(self, request, title, item_count=1):
+        job = DownloadJob(request, title, item_count)
         with self._condition:
             self.jobs.append(job)
             self._condition.notify()          # wake the worker: there is something to do
@@ -95,6 +95,13 @@ class DownloadQueue:
                 return
         self.on_change(job)
 
+    def clear_finished(self):
+        """Forget jobs that are over (done, failed or cancelled)."""
+        with self._condition:
+            active = (JobState.PENDING, JobState.DOWNLOADING, JobState.PAUSED)
+            self.jobs = [job for job in self.jobs if job.state in active]
+
+            
     # ------------------------------------------------------------
     # The background worker
     # ------------------------------------------------------------
