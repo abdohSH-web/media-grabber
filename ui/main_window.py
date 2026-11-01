@@ -5,8 +5,10 @@ from PySide6.QtCore import QSettings, QStandardPaths, Qt, QThreadPool, QUrl
 from PySide6.QtGui import QDesktopServices, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QFileDialog,
     QHBoxLayout,
     QHeaderView,
@@ -31,6 +33,7 @@ from grabber.jobs import DownloadQueue, JobState
 from grabber.models import CookieSettings, DownloadRequest, Mode
 
 from .formatting import format_duration, format_eta, format_speed
+from .playlist_dialog import PlaylistDialog
 from .workers import QueueBridge, Worker, load_thumbnail
 
 # Quality choices offered for playlists (each video has its own list of heights)
@@ -56,6 +59,14 @@ def make_table(headers):
     table.verticalHeader().setVisible(False)
     return table
 
+def item_position(job, progress):
+    """Which item of the job are we on? With a hand-picked selection, positions
+    are not 1, 2, 3 (they could be 4, 9, 12), so we count inside the selection."""
+    items = job.request.items
+    if items and progress.item_index in items:
+        return items.index(progress.item_index) + 1
+    return progress.item_index
+
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -66,6 +77,7 @@ class MainWindow(QMainWindow):
         self.downloader = Downloader()
         self.pool = QThreadPool.globalInstance()   # used for fetching info
         self.info = None              # MediaInfo of the last fetched link (None = nothing ready)
+        self.selected_items = None    # chosen playlist positions (None = the whole playlist)
         self.fetch_worker = None      # we keep a reference so Python doesn't delete it
 
         # The queue runs in its own Python thread. The bridge hands its updates to Qt safely.
@@ -88,6 +100,11 @@ class MainWindow(QMainWindow):
         self.refresh_history_table()
         self.update_buttons()
 
+        # Restore the window size and position from the last run
+        geometry = self.settings.value("window/geometry")
+        if geometry is not None:
+            self.restoreGeometry(geometry)
+
     # ============================================================
     # Building the window
     # ============================================================
@@ -103,15 +120,19 @@ class MainWindow(QMainWindow):
         layout.setSpacing(12)
         layout.setContentsMargins(20, 20, 20, 20)
 
-        # --- Row 1: the link + Fetch button ---
+        # --- Row 1: the link + Paste + Fetch buttons ---
         link_row = QHBoxLayout()               # places things side by side
         self.url_edit = QLineEdit()
         self.url_edit.setPlaceholderText("Paste a link here...")
         self.url_edit.setClearButtonEnabled(True)
         self.url_edit.returnPressed.connect(self.on_fetch_clicked)   # Enter key
+        self.paste_button = QPushButton("Paste link")
+        self.paste_button.clicked.connect(self.on_paste_clicked)
         self.fetch_button = QPushButton("Fetch")
+        self.fetch_button.setObjectName("primary")      # the theme gives it the accent colour
         self.fetch_button.clicked.connect(self.on_fetch_clicked)
         link_row.addWidget(self.url_edit, stretch=1)    # stretch=1: takes the free space
+        link_row.addWidget(self.paste_button)
         link_row.addWidget(self.fetch_button)
         layout.addLayout(link_row)
 
@@ -130,8 +151,12 @@ class MainWindow(QMainWindow):
         self.title_label.setWordWrap(True)
         self.title_label.setStyleSheet("font-size: 16px; font-weight: bold;")
         self.meta_label = QLabel("")
+        self.choose_button = QPushButton("Choose videos...")
+        self.choose_button.setVisible(False)            # only shown for playlists
+        self.choose_button.clicked.connect(self.on_choose_clicked)
         text_column.addWidget(self.title_label)
         text_column.addWidget(self.meta_label)
+        text_column.addWidget(self.choose_button, alignment=Qt.AlignmentFlag.AlignLeft)
         text_column.addStretch()
 
         card.addWidget(self.thumbnail_label)
@@ -186,6 +211,7 @@ class MainWindow(QMainWindow):
 
         # --- Row 6: add to the queue ---
         self.add_button = QPushButton("Add to queue")
+        self.add_button.setObjectName("primary")
         self.add_button.setEnabled(False)              # nothing fetched yet
         self.add_button.clicked.connect(self.on_add_clicked)
         layout.addWidget(self.add_button)
@@ -251,6 +277,7 @@ class MainWindow(QMainWindow):
     def set_busy(self, busy, message):
         """Used while FETCHING: lock the buttons and show a status message."""
         self.fetch_button.setEnabled(not busy)
+        self.paste_button.setEnabled(not busy)
         self.add_button.setEnabled(not busy and self.info is not None)
         self.status_label.setText(message)
 
@@ -353,6 +380,8 @@ class MainWindow(QMainWindow):
             return
 
         self.info = None                       # the old info no longer matches the box
+        self.selected_items = None
+        self.choose_button.setVisible(False)
         self.title_label.setText("Loading...")
         self.meta_label.setText("")
         self.show_thumbnail(None)
@@ -373,35 +402,82 @@ class MainWindow(QMainWindow):
         """Runs in the MAIN thread (Qt delivers the signal there): widgets are safe."""
         info, thumbnail_bytes = result
         self.info = info
+        self.selected_items = None             # None = all videos of the playlist
         self.title_label.setText(info.title)
-        self.meta_label.setText(self.describe(info))
         self.show_thumbnail(thumbnail_bytes)
+        self.choose_button.setVisible(info.is_playlist)
+        self.refresh_meta()
 
         if info.is_playlist:
             self.fill_qualities(PRESET_HEIGHTS)
-            message = f"Playlist with {info.entry_count} items. Choose your options and add it to the queue."
+            message = (
+                f"Playlist with {info.entry_count} items. "
+                "Press 'Choose videos...' to pick some, or add them all."
+            )
         else:
             self.fill_qualities(info.heights)
             message = "Ready. Choose your options and add it to the queue."
         self.set_busy(False, message)
-
+    
     def on_fetch_failed(self, message):
         self.title_label.setText("Paste a link and press Fetch")
         self.set_busy(False, "Something went wrong.")
         QMessageBox.warning(self, "Media Grabber", message)
 
+    def on_paste_clicked(self):
+        text = QApplication.clipboard().text().strip()
+        if not text:
+            self.status_label.setText("The clipboard is empty.")
+            return
+        self.url_edit.setText(text)
+        self.on_fetch_clicked()                # paste and fetch in one click
+
+    def refresh_meta(self):
+        """The grey line under the title (uploader, duration, selection...)."""
+        if self.info is None:
+            return
+        text = self.describe(self.info)
+        if self.info.is_playlist and self.selected_items is not None:
+            text += f"  •  {len(self.selected_items)} of {self.info.entry_count} selected"
+        self.meta_label.setText(text)
+
+    def on_choose_clicked(self):
+        if self.info is None or not self.info.is_playlist:
+            return
+        dialog = PlaylistDialog(self.info.entries, self.selected_items, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:      # the user pressed Cancel
+            return
+
+        chosen = dialog.selected_indices()
+        # Everything checked = no selection needed: store None, it's simpler
+        self.selected_items = None if len(chosen) == len(self.info.entries) else chosen
+        self.refresh_meta()
+
+    def closeEvent(self, event):
+        """Qt calls this when the window is closing: save its size and position."""
+        self.settings.setValue("window/geometry", self.saveGeometry())
+        super().closeEvent(event)
+
+
     # ============================================================
     # Step B: the queue
     # ============================================================
     def on_add_clicked(self):
+        items = self.selected_items if self.info.is_playlist else None
+        if items is not None and len(items) == 0:
+            QMessageBox.warning(self, "Media Grabber", "Select at least one video first.")
+            return
+
         request = DownloadRequest(
             url=self.info.url,
             folder=Path(self.folder_edit.text()),
             mode=Mode.AUDIO if self.audio_radio.isChecked() else Mode.VIDEO,
             max_height=self.quality_box.currentData(),     # the hidden value (or None)
             playlist=self.info.is_playlist,
+            items=items,
         )
-        self.queue.add(request, self.info.title, item_count=self.info.entry_count)
+        count = len(items) if items else self.info.entry_count
+        self.queue.add(request, self.info.title, item_count=count)
         self.status_label.setText("Added to the queue.")
 
     def selected_job(self):
@@ -501,7 +577,7 @@ class MainWindow(QMainWindow):
 
         parts = ["Downloading"]
         if job.item_count > 1 and p.item_index:
-            parts = [f"Item {p.item_index}/{job.item_count}"]
+            parts = [f"Item {item_position(job, p)}/{job.item_count}"]
         if p.speed:
             parts.append(format_speed(p.speed))
         if p.eta is not None:
@@ -517,7 +593,7 @@ class MainWindow(QMainWindow):
             return 0
         if job.item_count > 1 and p.item_index:
             # Overall progress = finished items + the fraction of the current one
-            return ((p.item_index - 1) + p.percent / 100) / job.item_count * 100
+            return ((item_position(job, p) - 1) + p.percent / 100) / job.item_count * 100
         return p.percent
 
     # ============================================================
@@ -533,6 +609,7 @@ class MainWindow(QMainWindow):
             folder=str(job.request.folder),
             finished_at=datetime.now().isoformat(timespec="seconds"),
             file_count=len(job.files),
+            items=list(job.request.items) if job.request.items else None,
         )
         try:
             self.history.add(entry)
@@ -576,14 +653,16 @@ class MainWindow(QMainWindow):
         entry = self.selected_history_entry()
         if entry is None:
             return
+        items = tuple(entry.items) if entry.items else None
         request = DownloadRequest(
             url=entry.url,
             folder=Path(entry.folder),
             mode=Mode(entry.mode),                 # "video" -> Mode.VIDEO
             max_height=entry.max_height,
             playlist=entry.playlist,
+            items=items,
         )
-        item_count = entry.file_count if entry.playlist else 1
+        item_count = len(items) if items else (entry.file_count if entry.playlist else 1)
         self.queue.add(request, entry.title, item_count=item_count)
         self.tabs.setCurrentIndex(0)               # jump to the Downloads tab
         self.status_label.setText("Added to the queue.")

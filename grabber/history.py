@@ -17,6 +17,7 @@ class HistoryEntry:
     folder: str
     finished_at: str           # ISO text, e.g. "2026-11-01T14:30:05"
     file_count: int
+    items: list[int] | None = None   # chosen playlist positions (None = the whole playlist)
 
 
 class HistoryStore:

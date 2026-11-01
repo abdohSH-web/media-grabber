@@ -10,8 +10,15 @@ class Mode(Enum):
 
 
 # @dataclass writes __init__ and __repr__ for us.
-# frozen=True makes the objects read-only after creation (safer: nobody
-# changes them by accident while a download is running).
+# frozen=True makes the objects read-only after creation.
+
+@dataclass(frozen=True)
+class PlaylistEntry:
+    """One video inside a playlist, as listed BEFORE downloading."""
+    index: int                           # position in the playlist, starting at 1
+    title: str
+    duration_seconds: int | None
+
 
 @dataclass(frozen=True)
 class MediaInfo:
@@ -23,7 +30,8 @@ class MediaInfo:
     thumbnail_url: str | None
     is_playlist: bool
     entry_count: int
-    heights: tuple[int, ...] = ()        # available video heights, e.g. (1080, 720, 360)
+    heights: tuple[int, ...] = ()                  # available video heights, e.g. (1080, 720)
+    entries: tuple[PlaylistEntry, ...] = ()        # the videos of a playlist
 
 
 @dataclass(frozen=True)
@@ -34,17 +42,18 @@ class DownloadRequest:
     mode: Mode = Mode.VIDEO
     max_height: int | None = None        # None = the best quality available
     playlist: bool = False
+    items: tuple[int, ...] | None = None  # playlist positions to download (None = all)
 
 
 @dataclass(frozen=True)
 class Progress:
     """One progress report, sent to whoever is listening."""
     status: str                          # "downloading", "processing" or "finished"
-    percent: float                       # 0 to 100, for the CURRENT file
+    percent: float                       # 0 to 100, for the CURRENT item (all its streams)
     speed: float | None                  # bytes per second
     eta: int | None                      # seconds left
     filename: str
-    item_index: int | None = None        # position inside a playlist (1, 2, 3...), else None
+    item_index: int | None = None        # position inside a playlist, else None
 
 
 @dataclass(frozen=True)

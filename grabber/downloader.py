@@ -1,8 +1,9 @@
+import os
 from pathlib import Path
 from urllib.parse import urlparse
 
 from yt_dlp import YoutubeDL
-from yt_dlp.utils import YoutubeDLError, DownloadCancelled         
+from yt_dlp.utils import DownloadCancelled, YoutubeDLError
 
 from .errors import (
     CookieProblemError,
@@ -13,8 +14,39 @@ from .errors import (
     UserCancelledError,
     VerificationRequiredError,
 )
-from .models import CookieSettings, DownloadRequest, DownloadResult, MediaInfo, Mode, Progress
+from .models import (
+    CookieSettings,
+    DownloadRequest,
+    DownloadResult,
+    MediaInfo,
+    Mode,
+    PlaylistEntry,
+    Progress,
+)
 from .tools import find_tool
+
+
+class _SilentLogger:
+    """yt-dlp prints a lot to the terminal. Giving it this logger silences it:
+    the window shows our own, friendlier messages instead."""
+
+    def debug(self, message):
+        pass
+
+    def info(self, message):
+        pass
+
+    def warning(self, message):
+        pass
+
+    def error(self, message):
+        pass
+
+
+def _logger():
+    """Set the environment variable MEDIA_GRABBER_DEBUG=1 to get yt-dlp's normal
+    terminal output back (None = its default). Handy when something misbehaves."""
+    return None if os.environ.get("MEDIA_GRABBER_DEBUG") else _SilentLogger()
 
 
 def validate_url(url):
@@ -91,15 +123,16 @@ class Downloader:
             # yt-dlp expects a tuple here: (browser name,)
             options["cookiesfrombrowser"] = (self.cookies.browser,)
 
-    
+    # ------------------------------------------------------------
     # 1) Look at a link without downloading it
-    
+    # ------------------------------------------------------------
     def fetch_info(self, url, playlist=False):
         url = validate_url(url)
 
         options = {
             "quiet": True,
             "no_warnings": True,
+            "logger": _logger(),
             "noplaylist": not playlist,
             # "flat" = list a playlist's entries without analysing every video (fast)
             "extract_flat": "in_playlist",
@@ -116,11 +149,19 @@ class Downloader:
 
     @staticmethod
     def _to_media_info(url, info):
-        entries = info.get("entries")
-        is_playlist = entries is not None
+        raw_entries = info.get("entries")
+        is_playlist = raw_entries is not None
 
         heights = ()
-        if not is_playlist:
+        entries = ()
+        if is_playlist:
+            # enumerate BEFORE dropping empty entries: positions must match the playlist
+            entries = tuple(
+                PlaylistEntry(index, entry.get("title") or "Untitled", entry.get("duration"))
+                for index, entry in enumerate(list(raw_entries), start=1)
+                if entry
+            )
+        else:
             # Keep only real video formats that report a height
             found = {
                 f["height"]
@@ -136,13 +177,14 @@ class Downloader:
             duration_seconds=info.get("duration"),
             thumbnail_url=info.get("thumbnail"),
             is_playlist=is_playlist,
-            entry_count=len(list(entries)) if is_playlist else 1,
+            entry_count=len(entries) if is_playlist else 1,
             heights=heights,
+            entries=entries,
         )
 
-    
+    # ------------------------------------------------------------
     # 2) Download
-    
+    # ------------------------------------------------------------
     def download(self, request, on_progress=None, cancel_event=None):
         """Download according to `request`.
         on_progress  : OPTIONAL function that receives Progress objects (a callback).
@@ -156,6 +198,10 @@ class Downloader:
                 "and restart the app."
             )
 
+        # A video is usually TWO files (picture + sound). To show ONE smooth bar per
+        # item, we count how many streams of the current item are already finished.
+        state = {"item": None, "finished": 0}
+
         def hook(d):
             # yt-dlp calls this many times per second with a dict called d.
 
@@ -166,19 +212,30 @@ class Downloader:
             if on_progress is None:
                 return
 
+            info_dict = d.get("info_dict") or {}
+            item_index = info_dict.get("playlist_index")
+            if item_index != state["item"]:          # a new playlist item started
+                state["item"] = item_index
+                state["finished"] = 0
+            stream_count = len(info_dict.get("requested_formats") or []) or 1
+
             # 2) Report progress
             if d.get("status") == "downloading":
                 total = d.get("total_bytes") or d.get("total_bytes_estimate")
                 done = d.get("downloaded_bytes") or 0
-                percent = done / total * 100 if total else 0.0
-                item_index = (d.get("info_dict") or {}).get("playlist_index")
+                fraction = done / total if total else 0.0
+                percent = min((state["finished"] + fraction) / stream_count * 100, 100.0)
                 on_progress(Progress(
                     "downloading", percent, d.get("speed"), d.get("eta"),
                     d.get("filename", ""), item_index,
                 ))
             elif d.get("status") == "finished":
-                # One file finished downloading; merging/converting comes next
-                on_progress(Progress("processing", 100.0, None, None, d.get("filename", "")))
+                state["finished"] += 1
+                # Only when ALL streams are downloaded does merging/converting begin
+                if state["finished"] >= stream_count:
+                    on_progress(Progress(
+                        "processing", 100.0, None, None, d.get("filename", ""), item_index,
+                    ))
 
         try:
             options = self._build_options(request, hook)
@@ -202,7 +259,7 @@ class Downloader:
         folder.mkdir(parents=True, exist_ok=True)
 
         if request.playlist:
-            # A subfolder per playlist, files numbered in order
+            # A subfolder per playlist, files numbered by their place in the playlist
             template = "%(playlist_title)s/%(playlist_index)s - %(title)s [%(id)s].%(ext)s"
         else:
             template = "%(title)s [%(id)s].%(ext)s"
@@ -212,6 +269,7 @@ class Downloader:
             "noplaylist": not request.playlist,
             "quiet": True,
             "no_warnings": True,
+            "logger": _logger(),
             "windowsfilenames": True,            # no characters Windows forbids
             "ffmpeg_location": self.ffmpeg,
             "progress_hooks": [hook],
@@ -235,6 +293,9 @@ class Downloader:
         if request.playlist:
             # Skip a broken item instead of stopping the whole playlist
             options["ignoreerrors"] = "only_download"
+            if request.items:
+                # "1,3,7" = only these positions
+                options["playlist_items"] = ",".join(str(i) for i in request.items)
 
         self._apply_cookies(options)
         return options
