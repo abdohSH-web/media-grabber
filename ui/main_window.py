@@ -43,6 +43,9 @@ class MainWindow(QMainWindow):
         self.fetch_worker = None      # we keep references so Python doesn't delete them
         self.download_worker = None
         self.cancel_event = None      # a threading.Event shared with the download thread
+        self.current_request = None   # the request being downloaded right now
+        self.paused_request = None    # the request waiting to be resumed (None = not paused)
+        self.stop_reason = None       # "pause", "cancel", or None
 
         # QSettings remembers small settings between runs (on Windows: in the registry)
         self.settings = QSettings("MediaGrabber", "MediaGrabber")
@@ -51,9 +54,9 @@ class MainWindow(QMainWindow):
         self.build_ui()
         self.load_cookie_settings()
 
-    # ============================================================
+    
     # Building the window
-    # ============================================================
+    
     def build_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
@@ -147,6 +150,9 @@ class MainWindow(QMainWindow):
         self.download_button = QPushButton("Download")
         self.download_button.setEnabled(False)          # nothing to download yet
         self.download_button.clicked.connect(self.on_download_clicked)
+        self.pause_button = QPushButton("Pause")
+        self.pause_button.setEnabled(False)             # only while a download runs
+        self.pause_button.clicked.connect(self.on_pause_clicked)
         self.cancel_button = QPushButton("Cancel")
         self.cancel_button.setEnabled(False)            # only while a download runs
         self.cancel_button.clicked.connect(self.on_cancel_clicked)
@@ -154,6 +160,7 @@ class MainWindow(QMainWindow):
         self.open_button.setEnabled(False)
         self.open_button.clicked.connect(self.open_folder)
         buttons_row.addWidget(self.download_button, stretch=1)
+        buttons_row.addWidget(self.pause_button)
         buttons_row.addWidget(self.cancel_button)
         buttons_row.addWidget(self.open_button)
         layout.addLayout(buttons_row)
@@ -167,9 +174,9 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.status_label)
         layout.addStretch()
 
-    # ============================================================
+    
     # Small helpers
-    # ============================================================
+    
     def set_busy(self, busy, message):
         """Lock or unlock the buttons, and show a status message."""
         self.fetch_button.setEnabled(not busy)
@@ -221,9 +228,9 @@ class MainWindow(QMainWindow):
         if self.last_folder:
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.last_folder)))
 
-    # ============================================================
+    
     # Cookies setting
-    # ============================================================
+    
     def current_cookie_settings(self):
         choice = self.cookie_box.currentData()
         if choice == "file":
@@ -270,9 +277,9 @@ class MainWindow(QMainWindow):
             self.cookie_file_label.setText(self.cookie_file.name)
         self.downloader.cookies = self.current_cookie_settings()
 
-    # ============================================================
+    
     # Step A: fetch info
-    # ============================================================
+    
     def on_fetch_clicked(self):
         url = self.url_edit.text().strip()
         if not url:
@@ -311,9 +318,9 @@ class MainWindow(QMainWindow):
             message = "Ready. Choose your options and press Download."
         self.set_busy(False, message)
 
-    # ============================================================
-    # Step B: download
-    # ============================================================
+    
+    # Step B: download (with pause / resume / cancel)
+    
     def on_download_clicked(self):
         request = DownloadRequest(
             url=self.info.url,
@@ -325,10 +332,20 @@ class MainWindow(QMainWindow):
         self.last_folder = request.folder
         self.open_button.setEnabled(False)
         self.reset_progress()
+        self.start_download(request)
+
+    def start_download(self, request):
+        """Start a download, or RESTART one after a pause."""
+        self.current_request = request
+        self.paused_request = None
+        self.stop_reason = None
+
         self.set_busy(True, "Starting...")
+        self.pause_button.setText("Pause")
+        self.pause_button.setEnabled(True)
         self.cancel_button.setEnabled(True)
 
-        # A fresh "flag" for this download. The Cancel button raises it,
+        # A fresh "flag" for this run. Pause and Cancel raise it,
         # and the download thread checks it many times per second.
         self.cancel_event = threading.Event()
 
@@ -343,14 +360,44 @@ class MainWindow(QMainWindow):
         self.download_worker = worker
         self.pool.start(worker)
 
+    def on_pause_clicked(self):
+        # The same button does two jobs, depending on the current state
+        if self.paused_request is not None:
+            self.start_download(self.paused_request)       # "Resume"
+            return
+
+        if self.cancel_event is not None:                  # "Pause"
+            self.stop_reason = "pause"
+            self.cancel_event.set()
+            self.pause_button.setEnabled(False)
+            self.cancel_button.setEnabled(False)
+            self.status_label.setText("Pausing...")
+
     def on_cancel_clicked(self):
+        if self.paused_request is not None:
+            # Cancelling while paused: just forget the paused download
+            self.paused_request = None
+            self.pause_button.setText("Pause")
+            self.pause_button.setEnabled(False)
+            self.cancel_button.setEnabled(False)
+            self.reset_progress()
+            self.set_busy(False, "Cancelled. Unfinished .part files may remain in the folder.")
+            return
+
         if self.cancel_event is not None:
-            self.cancel_event.set()                        # raise the flag
+            self.stop_reason = "cancel"
+            self.cancel_event.set()
+            self.pause_button.setEnabled(False)
             self.cancel_button.setEnabled(False)
             self.status_label.setText("Cancelling...")
 
     def on_progress(self, p):
         if p.status == "downloading":
+            # Progress signals may still arrive just after we asked to stop
+            if self.stop_reason is None:
+                self.pause_button.setEnabled(True)
+                self.cancel_button.setEnabled(True)
+
             percent = p.percent
             prefix = ""
             if self.info and self.info.is_playlist and p.item_index:
@@ -367,7 +414,11 @@ class MainWindow(QMainWindow):
             if p.eta is not None:
                 parts.append(f"{format_eta(p.eta)} left")
             self.status_label.setText("  •  ".join(parts))
+
         elif p.status == "processing":
+            # FFmpeg's merge can't be stopped half-way, so lock both buttons for now
+            self.pause_button.setEnabled(False)
+            self.cancel_button.setEnabled(False)
             self.progress.setRange(0, 0)       # (0, 0) = a bar that just moves: "working..."
             self.status_label.setText("Processing (merging / converting)...")
 
@@ -377,22 +428,40 @@ class MainWindow(QMainWindow):
         if self.info and self.info.is_playlist and saved < self.info.entry_count:
             message += f" {self.info.entry_count - saved} item(s) were skipped."
 
+        self.stop_reason = None
         self.progress.setRange(0, 100)
         self.progress.setValue(100)
+        self.pause_button.setText("Pause")
+        self.pause_button.setEnabled(False)
         self.cancel_button.setEnabled(False)
         self.set_busy(False, message)
         self.open_button.setEnabled(True)
 
     def on_cancelled(self):
+        """The download thread stopped because we asked it to (pause OR cancel)."""
+        if self.stop_reason == "pause":
+            self.paused_request = self.current_request
+            self.pause_button.setText("Resume")
+            self.pause_button.setEnabled(True)
+            self.cancel_button.setEnabled(True)    # lets the user discard the paused download
+            # We do NOT call set_busy(False): Fetch and Download stay locked while paused
+            self.status_label.setText("Paused. Press Resume to continue.")
+            return
+
         self.reset_progress()
+        self.pause_button.setEnabled(False)
         self.cancel_button.setEnabled(False)
         self.set_busy(False, "Cancelled. Unfinished .part files may remain in the folder.")
 
-    # ============================================================
+    
     # Errors (from either worker)
-    # ============================================================
+    
     def on_failed(self, message):
+        self.stop_reason = None
+        self.paused_request = None
         self.reset_progress()
+        self.pause_button.setText("Pause")
+        self.pause_button.setEnabled(False)
         self.cancel_button.setEnabled(False)
         self.title_label.setText(self.info.title if self.info else "Paste a link and press Fetch")
         self.set_busy(False, "Something went wrong.")

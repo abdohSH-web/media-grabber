@@ -9,6 +9,7 @@
         "ignoreerrors",
         "noplaylist",
         "outtmpl",
+        "Pixmap",
         "postprocessors",
         "preferredcodec",
         "preferredquality",
