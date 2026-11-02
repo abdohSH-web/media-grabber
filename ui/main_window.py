@@ -35,7 +35,7 @@ from grabber.models import CookieSettings, DownloadRequest, Mode
 from grabber.tools import find_tool
 from grabber.updates import installed_version, is_newer, latest_version
 
-from .formatting import format_duration, format_eta, format_speed
+from .formatting import format_duration, format_eta, format_size, format_speed
 from .playlist_dialog import PlaylistDialog
 from .workers import QueueBridge, Worker, load_thumbnail
 
@@ -75,7 +75,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Media Grabber")
-        self.resize(800, 780)
+        self.resize(1000, 780)
 
         self.downloader = Downloader()
         self.pool = QThreadPool.globalInstance()   # used for fetching info
@@ -228,12 +228,13 @@ class MainWindow(QMainWindow):
 
         # --- The queue table ---
         layout.addWidget(QLabel("Queue"))
-        self.table = make_table(["Title", "Status", "Progress"])
+        self.table = make_table(["Title", "Status", "Size", "Speed", "Left", "Progress"])
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
-        self.table.setColumnWidth(2, 170)
+        # Fixed widths: the numbers change many times a second, and the columns mustn't jump
+        for column, width in ((1, 110), (2, 150), (3, 90), (4, 140), (5, 130)):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.Fixed)
+            self.table.setColumnWidth(column, width)
         self.table.itemSelectionChanged.connect(self.update_buttons)
         layout.addWidget(self.table, stretch=1)
 
@@ -606,24 +607,30 @@ class MainWindow(QMainWindow):
         while self.table.rowCount() <= row:
             new_row = self.table.rowCount()
             self.table.insertRow(new_row)
-            self.table.setItem(new_row, 0, QTableWidgetItem(""))
-            self.table.setItem(new_row, 1, QTableWidgetItem(""))
+            for column in range(5):                    # the five text columns
+                self.table.setItem(new_row, column, QTableWidgetItem(""))
             bar = QProgressBar()
             bar.setRange(0, 100)
-            self.table.setCellWidget(new_row, 2, bar)
+            self.table.setCellWidget(new_row, 5, bar)  # the last column
 
     def update_row(self, job):
         try:
             row = self.queue.jobs.index(job)
         except ValueError:
-            return                              # the job was cleared meanwhile
+            return                                     # the job was cleared meanwhile
         self.ensure_row(row)
 
-        self.table.item(row, 0).setText(job.title)
-        status_item = self.table.item(row, 1)
-        status_item.setText(self.status_text(job))
-        status_item.setToolTip(job.message if job.state is JobState.FAILED else "")
-        self.table.cellWidget(row, 2).setValue(int(self.job_percent(job)))
+        texts = (
+            job.title,
+            self.status_text(job),
+            self.size_text(job),
+            self.speed_text(job),
+            self.left_text(job),
+        )
+        for column, text in enumerate(texts):
+            self.table.item(row, column).setText(text)
+        self.table.item(row, 1).setToolTip(job.message if job.state is JobState.FAILED else "")
+        self.table.cellWidget(row, 5).setValue(int(self.job_percent(job)))
 
     def rebuild_table(self):
         self.table.setRowCount(0)
@@ -641,14 +648,40 @@ class MainWindow(QMainWindow):
             return "Starting..."
         if p.status == "processing":
             return "Processing..."
-
-        parts = ["Downloading"]
         if job.item_count > 1 and p.item_index:
-            parts = [f"Item {item_position(job, p)}/{job.item_count}"]
-        if p.speed:
-            parts.append(format_speed(p.speed))
+            return f"Item {item_position(job, p)}/{job.item_count}"
+        return "Downloading"
+
+    @staticmethod
+    def size_text(job):
+        """'125.3 MB / 480.2 MB' while downloading, the final size when done."""
+        if job.state is JobState.DONE:
+            return format_size(job.size_bytes) if job.size_bytes else ""
+        p = job.progress
+        if p is None or not p.downloaded_bytes:
+            return ""
+        if p.total_bytes:
+            return f"{format_size(p.downloaded_bytes)} / {format_size(p.total_bytes)}"
+        return format_size(p.downloaded_bytes)
+
+    @staticmethod
+    def speed_text(job):
+        p = job.progress
+        if job.state is JobState.DOWNLOADING and p and p.status == "downloading" and p.speed:
+            return format_speed(p.speed)
+        return ""
+
+    @staticmethod
+    def left_text(job):
+        """What remains: the size and the time, like '354.9 MB  •  1:02'."""
+        p = job.progress
+        if job.state is not JobState.DOWNLOADING or p is None or p.status != "downloading":
+            return ""
+        parts = []
+        if p.total_bytes and p.downloaded_bytes is not None:
+            parts.append(format_size(max(p.total_bytes - p.downloaded_bytes, 0)))
         if p.eta is not None:
-            parts.append(f"{format_eta(p.eta)} left")
+            parts.append(format_eta(p.eta))
         return "  •  ".join(parts)
 
     @staticmethod

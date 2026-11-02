@@ -20,3 +20,11 @@ def format_eta(seconds):
     """Seconds left -> '1:05'"""
     minutes, secs = divmod(int(seconds), 60)
     return f"{minutes}:{secs:02d}"
+
+def format_size(num_bytes):
+    """1536 -> '1.5 KB', 125_000_000 -> '119.2 MB'"""
+    size = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024

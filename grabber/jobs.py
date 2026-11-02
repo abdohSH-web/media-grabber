@@ -31,6 +31,7 @@ class DownloadJob:
         self.progress = None           # the latest Progress object (or None)
         self.message = ""              # error text or a short note
         self.files = ()                # filled when the job is DONE
+        self.size_bytes = None         # total size on disk, filled when the job is DONE
         self._stop_event = threading.Event()
         self._stop_reason = None       # "pause" or "cancel"
 
@@ -150,7 +151,19 @@ class DownloadQueue:
             self._finish(job, JobState.FAILED, f"Unexpected error: {e}")
         else:
             job.files = result.files
+            job.size_bytes = self._total_size(result.files)
             self._finish(job, JobState.DONE, "")
+
+    @staticmethod
+    def _total_size(files):
+        """Total size of the saved files in bytes (None if we can't tell)."""
+        total = 0
+        for file in files:
+            try:
+                total += file.stat().st_size
+            except OSError:
+                pass
+        return total or None
 
     def _finish(self, job, state, message):
         with self._condition:

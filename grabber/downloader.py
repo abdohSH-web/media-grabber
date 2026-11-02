@@ -198,9 +198,9 @@ class Downloader:
                 "and restart the app."
             )
 
-        # A video is usually TWO files (picture + sound). To show ONE smooth bar per
-        # item, we count how many streams of the current item are already finished.
-        state = {"item": None, "finished": 0}
+        # A video is usually TWO files (picture + sound). To report ONE smooth progress
+        # per item, we remember how much of the current item is already finished.
+        state = {"item": None, "finished": 0, "finished_bytes": 0}
 
         def hook(d):
             # yt-dlp calls this many times per second with a dict called d.
@@ -215,22 +215,41 @@ class Downloader:
             info_dict = d.get("info_dict") or {}
             item_index = info_dict.get("playlist_index")
             if item_index != state["item"]:          # a new playlist item started
-                state["item"] = item_index
-                state["finished"] = 0
-            stream_count = len(info_dict.get("requested_formats") or []) or 1
+                state.update(item=item_index, finished=0, finished_bytes=0)
+
+            formats = info_dict.get("requested_formats") or []
+            stream_count = len(formats) or 1
 
             # 2) Report progress
             if d.get("status") == "downloading":
-                total = d.get("total_bytes") or d.get("total_bytes_estimate")
-                done = d.get("downloaded_bytes") or 0
-                fraction = done / total if total else 0.0
-                percent = min((state["finished"] + fraction) / stream_count * 100, 100.0)
+                stream_total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+                stream_done = d.get("downloaded_bytes") or 0
+
+                done = state["finished_bytes"] + stream_done
+                # Size of ALL streams of this item, as announced by the site (may be approximate)
+                planned = sum((f.get("filesize") or f.get("filesize_approx") or 0) for f in formats)
+                total = planned if planned >= done else state["finished_bytes"] + stream_total
+
+                if total > 0 and total >= done:
+                    percent = done / total * 100
+                else:                                # sizes unknown: fall back to counting streams
+                    fraction = stream_done / stream_total if stream_total else 0.0
+                    percent = (state["finished"] + fraction) / stream_count * 100
+                    total = 0
+
+                speed = d.get("speed")
+                eta = d.get("eta")
+                if speed and total > done:
+                    eta = int((total - done) / speed)    # time for ALL streams, not just this one
+
                 on_progress(Progress(
-                    "downloading", percent, d.get("speed"), d.get("eta"),
-                    d.get("filename", ""), item_index,
+                    "downloading", min(percent, 100.0), speed, eta,
+                    d.get("filename", ""), item_index, done, total or None,
                 ))
+
             elif d.get("status") == "finished":
                 state["finished"] += 1
+                state["finished_bytes"] += d.get("total_bytes") or d.get("downloaded_bytes") or 0
                 # Only when ALL streams are downloaded does merging/converting begin
                 if state["finished"] >= stream_count:
                     on_progress(Progress(
@@ -258,17 +277,23 @@ class Downloader:
         folder = Path(request.folder)
         folder.mkdir(parents=True, exist_ok=True)
 
+        # File name = the title, plus the real quality for video: "My video [720p].mp4".
+        # "%(height& [{}p]|)s" means: if the video has a height, write " [720p]", else nothing.
+        quality = "" if request.mode is Mode.AUDIO else "%(height& [{}p]|)s"
+        name = f"%(title)s{quality}.%(ext)s"
+
         if request.playlist:
             # A subfolder per playlist, files numbered by their place in the playlist
-            template = "%(playlist_title)s/%(playlist_index)s - %(title)s [%(id)s].%(ext)s"
+            template = f"%(playlist_title)s/%(playlist_index)s - {name}"
         else:
-            template = "%(title)s [%(id)s].%(ext)s"
+            template = name
 
         options = {
             "outtmpl": str(folder / template),
             "noplaylist": not request.playlist,
             "quiet": True,
             "no_warnings": True,
+            "trim_file_name": 150,               # very long titles are shortened
             "logger": _logger(),
             "windowsfilenames": True,            # no characters Windows forbids
             "ffmpeg_location": self.ffmpeg,

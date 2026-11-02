@@ -51,9 +51,11 @@ class Progress:
     status: str                          # "downloading", "processing" or "finished"
     percent: float                       # 0 to 100, for the CURRENT item (all its streams)
     speed: float | None                  # bytes per second
-    eta: int | None                      # seconds left
+    eta: int | None                      # seconds left (for the whole item)
     filename: str
     item_index: int | None = None        # position inside a playlist, else None
+    downloaded_bytes: int | None = None  # bytes of the current item downloaded so far
+    total_bytes: int | None = None       # its total size (None when unknown)
 
 
 @dataclass(frozen=True)
