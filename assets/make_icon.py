@@ -5,7 +5,7 @@ from PIL import Image
 script_dir = Path(__file__).resolve().parent
 
 # أسماء الصور كما سميتها أنت
-image_files = ['16.png', '32.png', '48.png', '256.png']
+image_files = ['icon_16.png', 'icon_24.png', 'icon_32.png', 'icon_48.png', 'icon_64.png', 'icon_128.png', 'icon_256.png']
 
 # فتح الصور باستخدام المسار النسبي لمكان السكريبت
 images = [Image.open(script_dir / f) for f in image_files]

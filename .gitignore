@@ -7,3 +7,4 @@ cookies.txt
 build/
 dist/
 *.spec
+tools_bin/

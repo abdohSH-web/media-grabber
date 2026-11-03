@@ -13,5 +13,11 @@ pyinstaller --noconfirm --clean --windowed `
     --collect-all yt_dlp_ejs `
     main.py
 
+# Optional: copy FFmpeg / Deno next to the app (put them in the tools_bin folder first)
+if (Test-Path tools_bin) {
+    Copy-Item tools_bin dist\MediaGrabber\bin -Recurse -Force
+    Write-Host "Copied tools_bin to dist\MediaGrabber\bin"
+}
+
 Write-Host ""
 Write-Host "Done: dist\MediaGrabber\MediaGrabber.exe"
