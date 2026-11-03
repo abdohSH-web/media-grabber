@@ -41,8 +41,9 @@ from grabber.queue_store import QueueStore
 from grabber.tools import find_tool
 from grabber.updates import installed_version, is_newer, latest_version
 
+from .clip_dialog import ClipDialog
 from .formatting import format_duration, format_eta, format_size, format_speed
-from .parsing import parse_clip, parse_languages
+from .parsing import parse_languages
 from .playlist_dialog import PlaylistDialog
 from .theme import apply_theme
 from .workers import QueueBridge, Worker, load_thumbnail
@@ -93,6 +94,7 @@ class MainWindow(QMainWindow):
         self.pool = QThreadPool.globalInstance()   # used for fetching info and update checks
         self.info = None              # MediaInfo of the last fetched link (None = nothing ready)
         self.selected_items = None    # chosen playlist positions (None = the whole playlist)
+        self.clip_range = None        # (start, end) in seconds chosen in the clip window, or None
         self.fetch_worker = None      # we keep references so Python doesn't delete them
         self.update_worker = None
 
@@ -231,16 +233,16 @@ class MainWindow(QMainWindow):
         # --- Row 3c: download only a part of the video ---
         clip_row = QHBoxLayout()
         self.clip_check = QCheckBox("Download only a part")
-        self.from_edit = QLineEdit()
-        self.from_edit.setPlaceholderText("From  (0:00)")
-        self.to_edit = QLineEdit()
-        self.to_edit.setPlaceholderText("To  (the end)")
-        self.clip_check.toggled.connect(self.update_extra_options)
+        self.clip_check.toggled.connect(self.on_clip_toggled)
+        self.clip_button = QPushButton("Choose the part...")
+        self.clip_button.clicked.connect(self.on_choose_clip_clicked)
+        self.clip_label = QLabel("")
+        self.clip_label.setObjectName("muted")
         clip_row.addWidget(self.clip_check)
-        clip_row.addWidget(self.from_edit, stretch=1)
-        clip_row.addWidget(self.to_edit, stretch=1)
+        clip_row.addWidget(self.clip_button)
+        clip_row.addWidget(self.clip_label, stretch=1)
         layout.addLayout(clip_row)
-        self.update_extra_options()          # start with both rows greyed out
+        self.update_extra_options()          # start with the greyed-out look
 
         # --- Row 4: where to save ---
         folder_row = QHBoxLayout()
@@ -312,14 +314,16 @@ class MainWindow(QMainWindow):
         self.pause_button.clicked.connect(self.on_pause_clicked)
         self.cancel_button = QPushButton("Cancel")
         self.cancel_button.clicked.connect(self.on_cancel_clicked)
+        self.pause_all_button = QPushButton("Pause all")
+        self.pause_all_button.clicked.connect(self.on_pause_all_clicked)
         self.resume_all_button = QPushButton("Resume all")
         self.resume_all_button.clicked.connect(self.on_resume_all_clicked)
         self.open_button = QPushButton("Open folder")
         self.open_button.clicked.connect(self.open_job_folder)
         self.clear_button = QPushButton("Clear finished")
         self.clear_button.clicked.connect(self.on_clear_clicked)
-        for button in (self.pause_button, self.cancel_button, self.resume_all_button,
-                       self.open_button, self.clear_button):
+        for button in (self.pause_button, self.cancel_button, self.pause_all_button,
+                       self.resume_all_button, self.open_button, self.clear_button):
             buttons.addWidget(button)
         layout.addLayout(buttons)
         return page
@@ -441,8 +445,7 @@ class MainWindow(QMainWindow):
         self.subs_auto_check.setEnabled(subs_on)
 
         clip_on = self.clip_check.isChecked() and self.clip_check.isEnabled()
-        self.from_edit.setEnabled(clip_on)
-        self.to_edit.setEnabled(clip_on)
+        self.clip_button.setEnabled(clip_on)
 
     def fill_qualities(self, heights):
         self.quality_box.clear()
@@ -540,6 +543,8 @@ class MainWindow(QMainWindow):
 
         self.info = None                       # the old info no longer matches the box
         self.selected_items = None
+        self.clip_range = None                 # a new video: the old range means nothing
+        self.clip_check.setChecked(False)
         self.choose_button.setVisible(False)
         self.title_label.setText("Loading...")
         self.meta_label.setText("")
@@ -618,6 +623,40 @@ class MainWindow(QMainWindow):
         self.selected_items = None if len(chosen) == len(self.info.entries) else chosen
         self.refresh_meta()
 
+    def on_clip_toggled(self, checked):
+        self.update_extra_options()
+        if checked and self.clip_range is None:
+            self.on_choose_clip_clicked()        # open the window right away
+        self.refresh_clip_label()
+
+    def on_choose_clip_clicked(self):
+        if self.info is None or not self.info.duration_seconds:
+            QMessageBox.warning(
+                self, "Media Grabber",
+                "Fetch a video first. (A video whose length is unknown can't be trimmed.)",
+            )
+            self.clip_check.setChecked(False)
+            return
+
+        start, end = self.clip_range if self.clip_range else (None, None)
+        dialog = ClipDialog(self.info.duration_seconds, start, end, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            start, end = dialog.selected_range()
+            # (None, None) = the whole video = nothing to clip
+            self.clip_range = None if start is None else (start, end)
+
+        if self.clip_range is None:               # cancelled, or "whole video"
+            self.clip_check.setChecked(False)
+        self.refresh_clip_label()
+
+    def refresh_clip_label(self):
+        if not self.clip_check.isChecked() or self.clip_range is None:
+            self.clip_label.setText("")
+            return
+        start, end = self.clip_range
+        end_text = format_duration(end) if end is not None else "the end"
+        self.clip_label.setText(f"{format_duration(start)} → {end_text}")
+
     # ============================================================
     # Step B: the "Download" button puts a job in the queue
     # ============================================================
@@ -636,10 +675,10 @@ class MainWindow(QMainWindow):
 
             clip_start = clip_end = None
             if self.clip_check.isChecked() and not self.info.is_playlist:
-                clip_start, clip_end = parse_clip(
-                    self.from_edit.text(), self.to_edit.text(), self.info.duration_seconds
-                )
-        except ValueError as e:                 # bad text in one of the boxes
+                if self.clip_range is None:
+                    raise ValueError("Choose the part of the video first.")
+                clip_start, clip_end = self.clip_range
+        except ValueError as e:                 # something is missing or wrong
             QMessageBox.warning(self, "Media Grabber", str(e))
             return
 
@@ -682,6 +721,9 @@ class MainWindow(QMainWindow):
             state in (JobState.PENDING, JobState.DOWNLOADING, JobState.PAUSED)
         )
         self.open_button.setEnabled(job is not None)
+        self.pause_all_button.setEnabled(
+            any(j.state in (JobState.PENDING, JobState.DOWNLOADING) for j in self.queue.jobs)
+        )
         self.resume_all_button.setEnabled(
             any(j.state is JobState.PAUSED for j in self.queue.jobs)
         )
@@ -712,6 +754,17 @@ class MainWindow(QMainWindow):
         for job in list(self.queue.jobs):
             if job.state is JobState.PAUSED:
                 self.queue.resume(job)
+
+    def on_pause_all_clicked(self):
+        jobs = list(self.queue.jobs)
+        # Waiting jobs FIRST. Otherwise, the moment a running job pauses and frees its
+        # slot, a waiting job would grab it and start downloading.
+        for job in jobs:
+            if job.state is JobState.PENDING:
+                self.queue.pause(job)
+        for job in jobs:
+            if job.state is JobState.DOWNLOADING:
+                self.queue.pause(job)
 
     def open_job_folder(self):
         job = self.selected_job()

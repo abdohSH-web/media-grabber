@@ -76,7 +76,7 @@ def _translate_error(error):
         )
 
     cookie_trouble = ("could not copy", "decrypt", "database", "failed to", "not found")
-    if "cookie" in lowered and any(word in lowered for word in cookie_trouble):
+    if ("cookie" in lowered or "dpapi" in lowered) and any(word in lowered for word in cookie_trouble):
         return CookieProblemError(
             "Couldn't read the cookies. Close that browser completely and try again.\n"
             "On Windows, Chrome and Edge often block this: Firefox or a cookies.txt "
