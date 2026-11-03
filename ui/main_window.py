@@ -20,6 +20,8 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QRadioButton,
+    QStyle,
+    QSystemTrayIcon,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -37,6 +39,7 @@ from grabber.tools import find_tool
 from grabber.updates import installed_version, is_newer, latest_version
 
 from .formatting import format_duration, format_eta, format_size, format_speed
+from .parsing import parse_clip, parse_languages
 from .playlist_dialog import PlaylistDialog
 from .workers import QueueBridge, Worker, load_thumbnail
 
@@ -109,6 +112,7 @@ class MainWindow(QMainWindow):
         self.restore_queue()
         self.update_buttons()
         self.check_tools()
+        self.setup_tray()
 
         # Restore the window size and position from the last run
         geometry = self.settings.value("window/geometry")
@@ -192,6 +196,32 @@ class MainWindow(QMainWindow):
         options_row.addWidget(QLabel("Quality:"))
         options_row.addWidget(self.quality_box, stretch=1)
         layout.addLayout(options_row)
+        # --- Row 3b: subtitles ---
+        subs_row = QHBoxLayout()
+        self.subs_check = QCheckBox("Subtitles")
+        self.subs_edit = QLineEdit("ar,en")
+        self.subs_edit.setPlaceholderText("language codes, e.g. en,ar")
+        self.subs_auto_check = QCheckBox("include auto-generated")
+        self.subs_auto_check.setChecked(True)
+        self.subs_check.toggled.connect(self.update_extra_options)
+        subs_row.addWidget(self.subs_check)
+        subs_row.addWidget(self.subs_edit, stretch=1)
+        subs_row.addWidget(self.subs_auto_check)
+        layout.addLayout(subs_row)
+
+        # --- Row 3c: download only a part of the video ---
+        clip_row = QHBoxLayout()
+        self.clip_check = QCheckBox("Download only a part")
+        self.from_edit = QLineEdit()
+        self.from_edit.setPlaceholderText("From  (0:00)")
+        self.to_edit = QLineEdit()
+        self.to_edit.setPlaceholderText("To  (the end)")
+        self.clip_check.toggled.connect(self.update_extra_options)
+        clip_row.addWidget(self.clip_check)
+        clip_row.addWidget(self.from_edit, stretch=1)
+        clip_row.addWidget(self.to_edit, stretch=1)
+        layout.addLayout(clip_row)
+        self.update_extra_options()          # start with both rows greyed out
 
         # --- Row 4: where to save ---
         folder_row = QHBoxLayout()
@@ -263,11 +293,15 @@ class MainWindow(QMainWindow):
         # --- Footer: status on the left, yt-dlp version + update check on the right ---
         footer = QHBoxLayout()
         self.status_label = QLabel("Ready")
+        self.notify_check = QCheckBox("Notify when done")
+        self.notify_check.setChecked(self.settings.value("ui/notify", True, type=bool))
+        self.notify_check.toggled.connect(lambda checked: self.settings.setValue("ui/notify", checked))
         self.version_label = QLabel(f"yt-dlp {installed_version()}")
         self.version_label.setStyleSheet("color: #9a9da3;")
         self.update_button = QPushButton("Check for updates")
         self.update_button.clicked.connect(self.on_update_clicked)
         footer.addWidget(self.status_label, stretch=1)
+        footer.addWidget(self.notify_check)
         footer.addWidget(self.version_label)
         footer.addWidget(self.update_button)
         layout.addLayout(footer)
@@ -436,6 +470,11 @@ class MainWindow(QMainWindow):
         self.show_thumbnail(thumbnail_bytes)
         self.choose_button.setVisible(info.is_playlist)
         self.refresh_meta()
+        # Clipping makes no sense for a whole playlist
+        self.clip_check.setEnabled(not info.is_playlist)
+        if info.is_playlist:
+            self.clip_check.setChecked(False)
+        self.update_extra_options()
 
         if info.is_playlist:
             self.fill_qualities(PRESET_HEIGHTS)
@@ -482,9 +521,46 @@ class MainWindow(QMainWindow):
         self.selected_items = None if len(chosen) == len(self.info.entries) else chosen
         self.refresh_meta()
 
+    def update_extra_options(self, *_):
+        """Grey out the boxes of an option that isn't switched on."""
+        subs_on = self.subs_check.isChecked()
+        self.subs_edit.setEnabled(subs_on)
+        self.subs_auto_check.setEnabled(subs_on)
+
+        clip_on = self.clip_check.isChecked() and self.clip_check.isEnabled()
+        self.from_edit.setEnabled(clip_on)
+        self.to_edit.setEnabled(clip_on)
+
+    # ============================================================
+    # Notifications
+    # ============================================================
+    def setup_tray(self):
+        """A system-tray icon: it is what lets us show Windows notifications."""
+        self.tray = None
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        icon = QApplication.windowIcon()
+        if icon.isNull():
+            icon = self.style().standardIcon(QStyle.StandardPixmap.SP_DialogApplyButton)
+        self.tray = QSystemTrayIcon(icon, self)
+        self.tray.setToolTip("Media Grabber")
+        self.tray.show()
+
+    def notify_done(self, job):
+        """Tell the user a download finished, but only when they aren't looking at the window."""
+        if self.tray is None or not self.notify_check.isChecked() or self.isActiveWindow():
+            return
+        still_busy = any(
+            j.state in (JobState.PENDING, JobState.DOWNLOADING) for j in self.queue.jobs
+        )
+        title = "Download finished" if still_busy else "All downloads finished"
+        self.tray.showMessage(title, job.title, QSystemTrayIcon.MessageIcon.Information, 6000)
+
     def closeEvent(self, event):
         """Qt calls this when the window is closing: save its size and position."""
         self.settings.setValue("window/geometry", self.saveGeometry())
+        if self.tray is not None:
+            self.tray.hide()                  # so no ghost icon stays behind
         super().closeEvent(event)
     # ============================================================
     # Tools check and yt-dlp updates
@@ -545,6 +621,22 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Media Grabber", "Select at least one video first.")
             return
 
+        try:
+            subtitles = ()
+            if self.subs_check.isChecked():
+                subtitles = parse_languages(self.subs_edit.text())
+                if not subtitles:
+                    raise ValueError("Type at least one subtitle language, like en or ar.")
+
+            clip_start = clip_end = None
+            if self.clip_check.isChecked() and not self.info.is_playlist:
+                clip_start, clip_end = parse_clip(
+                    self.from_edit.text(), self.to_edit.text(), self.info.duration_seconds
+                )
+        except ValueError as e:                 # bad text in one of the boxes
+            QMessageBox.warning(self, "Media Grabber", str(e))
+            return
+
         request = DownloadRequest(
             url=self.info.url,
             folder=Path(self.folder_edit.text()),
@@ -552,6 +644,10 @@ class MainWindow(QMainWindow):
             max_height=self.quality_box.currentData(),     # the hidden value (or None)
             playlist=self.info.is_playlist,
             items=items,
+            subtitles=subtitles,
+            auto_subtitles=self.subs_auto_check.isChecked(),
+            clip_start=clip_start,
+            clip_end=clip_end,
         )
         count = len(items) if items else self.info.entry_count
         self.queue.add(request, self.info.title, item_count=count)
@@ -619,6 +715,7 @@ class MainWindow(QMainWindow):
         if job.state is JobState.DONE and job.id not in self.recorded:
             self.recorded.add(job.id)
             self.record_history(job)
+            self.notify_done(job)
 
     def save_queue(self):
         try:
@@ -754,6 +851,10 @@ class MainWindow(QMainWindow):
             finished_at=datetime.now().isoformat(timespec="seconds"),
             file_count=len(job.files),
             items=list(job.request.items) if job.request.items else None,
+            subtitles=list(job.request.subtitles) if job.request.subtitles else None,
+            auto_subtitles=job.request.auto_subtitles,
+            clip_start=job.request.clip_start,
+            clip_end=job.request.clip_end,
         )
         try:
             self.history.add(entry)
@@ -805,6 +906,10 @@ class MainWindow(QMainWindow):
             max_height=entry.max_height,
             playlist=entry.playlist,
             items=items,
+            subtitles=tuple(entry.subtitles or ()),
+            auto_subtitles=entry.auto_subtitles,
+            clip_start=entry.clip_start,
+            clip_end=entry.clip_end,
         )
         item_count = len(items) if items else (entry.file_count if entry.playlist else 1)
         self.queue.add(request, entry.title, item_count=item_count)

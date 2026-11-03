@@ -3,7 +3,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from yt_dlp import YoutubeDL
-from yt_dlp.utils import DownloadCancelled, YoutubeDLError
+from yt_dlp.utils import DownloadCancelled, YoutubeDLError, download_range_func
 
 from .errors import (
     CookieProblemError,
@@ -105,6 +105,15 @@ def _final_paths(info):
             if path:
                 paths.append(path)
     return paths
+
+def _clip_label(start, end):
+    """(65, 130) -> '01m05s-02m10s'. Goes into the file name, so a clip never
+    replaces (or gets skipped because of) the full video in the same folder."""
+    def part(seconds):
+        minutes, secs = divmod(int(seconds), 60)
+        return f"{minutes:02d}m{secs:02d}s"
+
+    return f"{part(start)}-{part(end)}" if end is not None else f"{part(start)}-end"
 
 
 class Downloader:
@@ -277,10 +286,11 @@ class Downloader:
         folder = Path(request.folder)
         folder.mkdir(parents=True, exist_ok=True)
 
-        # File name = the title, plus the real quality for video: "My video [720p].mp4".
+        # File name = title + (clip range) + (quality), like "My video [01m05s-02m10s] [720p].mp4"
         # "%(height& [{}p]|)s" means: if the video has a height, write " [720p]", else nothing.
         quality = "" if request.mode is Mode.AUDIO else "%(height& [{}p]|)s"
-        name = f"%(title)s{quality}.%(ext)s"
+        clip = f" [{_clip_label(request.clip_start, request.clip_end)}]" if request.has_clip else ""
+        name = f"%(title)s{clip}{quality}.%(ext)s"
 
         if request.playlist:
             # A subfolder per playlist, files numbered by their place in the playlist
@@ -293,20 +303,22 @@ class Downloader:
             "noplaylist": not request.playlist,
             "quiet": True,
             "no_warnings": True,
-            "trim_file_name": 150,               # very long titles are shortened
             "logger": _logger(),
             "windowsfilenames": True,            # no characters Windows forbids
+            "trim_file_name": 150,               # very long titles are shortened
             "ffmpeg_location": self.ffmpeg,
             "progress_hooks": [hook],
         }
 
+        postprocessors = []                      # extra steps yt-dlp runs with FFmpeg
+
         if request.mode is Mode.AUDIO:
             options["format"] = "bestaudio/best"
-            options["postprocessors"] = [{
+            postprocessors.append({
                 "key": "FFmpegExtractAudio",
                 "preferredcodec": "mp3",
                 "preferredquality": "192",
-            }]
+            })
         else:
             # "[height<=720]" caps the quality at 720p. (">=" would mean 720 or MORE.)
             limit = f"[height<={request.max_height}]" if request.max_height else ""
@@ -314,6 +326,26 @@ class Downloader:
             # Prefer H.264 video and AAC audio: they play everywhere on Windows
             options["format_sort"] = ["vcodec:h264", "res", "acodec:m4a"]
             options["merge_output_format"] = "mp4"
+
+        if request.subtitles:
+            options["writesubtitles"] = True
+            options["writeautomaticsub"] = request.auto_subtitles
+            options["subtitleslangs"] = list(request.subtitles)
+            # Saved next to the video as .srt files
+            postprocessors.append({
+                "key": "FFmpegSubtitlesConvertor",
+                "format": "srt",
+                "when": "before_dl",
+            })
+
+        if request.has_clip:
+            end = request.clip_end if request.clip_end is not None else float("inf")
+            options["download_ranges"] = download_range_func([], [(request.clip_start, end)])
+            # Slower (re-encodes around the cut points) but the cut is exact
+            options["force_keyframes_at_cuts"] = True
+
+        if postprocessors:
+            options["postprocessors"] = postprocessors
 
         if request.playlist:
             # Skip a broken item instead of stopping the whole playlist
