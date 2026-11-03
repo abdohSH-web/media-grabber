@@ -11,6 +11,8 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QFileDialog,
+    QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -20,6 +22,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QRadioButton,
+    QSpinBox,
     QStyle,
     QSystemTrayIcon,
     QTableWidget,
@@ -31,20 +34,24 @@ from PySide6.QtWidgets import (
 
 from grabber.downloader import Downloader
 from grabber.errors import HistoryError, QueueStoreError
-from grabber.queue_store import QueueStore
 from grabber.history import HistoryEntry, HistoryStore
-from grabber.jobs import DownloadQueue, JobState
+from grabber.jobs import MAX_PARALLEL, DownloadQueue, JobState
 from grabber.models import CookieSettings, DownloadRequest, Mode
+from grabber.queue_store import QueueStore
 from grabber.tools import find_tool
 from grabber.updates import installed_version, is_newer, latest_version
 
 from .formatting import format_duration, format_eta, format_size, format_speed
 from .parsing import parse_clip, parse_languages
 from .playlist_dialog import PlaylistDialog
+from .theme import apply_theme
 from .workers import QueueBridge, Worker, load_thumbnail
 
 # Quality choices offered for playlists (each video has its own list of heights)
 PRESET_HEIGHTS = (1080, 720, 480, 360)
+
+# The tabs, in order
+TAB_DOWNLOAD, TAB_QUEUE, TAB_HISTORY, TAB_SETTINGS = range(4)
 
 # What the Status column shows for states that need no extra details
 STATE_LABELS = {
@@ -66,6 +73,7 @@ def make_table(headers):
     table.verticalHeader().setVisible(False)
     return table
 
+
 def item_position(job, progress):
     """Which item of the job are we on? With a hand-picked selection, positions
     are not 1, 2, 3 (they could be 4, 9, 12), so we count inside the selection."""
@@ -79,16 +87,16 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Media Grabber")
-        self.resize(1000, 800)
+        self.resize(900, 780)
 
         self.downloader = Downloader()
-        self.pool = QThreadPool.globalInstance()   # used for fetching info
+        self.pool = QThreadPool.globalInstance()   # used for fetching info and update checks
         self.info = None              # MediaInfo of the last fetched link (None = nothing ready)
         self.selected_items = None    # chosen playlist positions (None = the whole playlist)
-        self.fetch_worker = None      # we keep a reference so Python doesn't delete it
+        self.fetch_worker = None      # we keep references so Python doesn't delete them
         self.update_worker = None
 
-        # The queue runs in its own Python thread. The bridge hands its updates to Qt safely.
+        # The queue runs in its own Python threads. The bridge hands its updates to Qt safely.
         self.bridge = QueueBridge()
         self.bridge.changed.connect(self.on_job_changed)
         self.queue = DownloadQueue(self.downloader, on_change=self.bridge.changed.emit)
@@ -101,6 +109,7 @@ class MainWindow(QMainWindow):
         self.recorded = set()         # ids of jobs already written to the history
         self.last_states = {}         # job id -> its last known state (to spot real changes)
         self.restoring = False
+        self.tray = None
 
         # QSettings remembers small settings between runs (on Windows: in the registry)
         self.settings = QSettings("MediaGrabber", "MediaGrabber")
@@ -108,6 +117,7 @@ class MainWindow(QMainWindow):
 
         self.build_ui()
         self.load_cookie_settings()
+        self.queue.set_max_parallel(self.parallel_spin.value())   # the saved setting
         self.refresh_history_table()
         self.restore_queue()
         self.update_buttons()
@@ -123,20 +133,27 @@ class MainWindow(QMainWindow):
     # Building the window
     # ============================================================
     def build_ui(self):
+        # The status bar sits at the bottom of the WINDOW, so messages show on every tab
+        self.status_label = QLabel("Ready")
+        self.statusBar().addWidget(self.status_label, 1)
+
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
-        self.tabs.addTab(self.build_downloads_tab(), "Downloads")
+        self.tabs.addTab(self.build_download_tab(), "Download")
+        self.tabs.addTab(self.build_queue_tab(), "Queue")
         self.tabs.addTab(self.build_history_tab(), "History")
+        self.tabs.addTab(self.build_settings_tab(), "Settings")
 
-    def build_downloads_tab(self):
+    def build_download_tab(self):
         page = QWidget()
         layout = QVBoxLayout(page)             # stacks things top to bottom
         layout.setSpacing(12)
         layout.setContentsMargins(20, 20, 20, 20)
+
         # A warning banner: only visible when FFmpeg or Deno is missing
         self.tools_label = QLabel("")
+        self.tools_label.setObjectName("warning")       # coloured by the theme
         self.tools_label.setWordWrap(True)
-        self.tools_label.setStyleSheet("color: #f0b429;")
         self.tools_label.setVisible(False)
         layout.addWidget(self.tools_label)
 
@@ -162,15 +179,16 @@ class MainWindow(QMainWindow):
         # --- Row 2: the info card (thumbnail + text) ---
         card = QHBoxLayout()
         self.thumbnail_label = QLabel("No preview")
+        self.thumbnail_label.setObjectName("thumbnail")
         self.thumbnail_label.setFixedSize(240, 135)
         self.thumbnail_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.thumbnail_label.setStyleSheet("background: #2b2b2b; color: #999;")
 
         text_column = QVBoxLayout()
         self.title_label = QLabel("Paste a link and press Fetch")
+        self.title_label.setObjectName("title")
         self.title_label.setWordWrap(True)
-        self.title_label.setStyleSheet("font-size: 16px; font-weight: bold;")
         self.meta_label = QLabel("")
+        self.meta_label.setObjectName("muted")
         self.choose_button = QPushButton("Choose videos...")
         self.choose_button.setVisible(False)            # only shown for playlists
         self.choose_button.clicked.connect(self.on_choose_clicked)
@@ -196,6 +214,7 @@ class MainWindow(QMainWindow):
         options_row.addWidget(QLabel("Quality:"))
         options_row.addWidget(self.quality_box, stretch=1)
         layout.addLayout(options_row)
+
         # --- Row 3b: subtitles ---
         subs_row = QHBoxLayout()
         self.subs_check = QCheckBox("Subtitles")
@@ -250,20 +269,34 @@ class MainWindow(QMainWindow):
         self.cookie_box.addItem("cookies.txt file...", "file")
         self.cookie_box.currentIndexChanged.connect(self.on_cookie_choice_changed)
         self.cookie_file_label = QLabel("")
+        self.cookie_file_label.setObjectName("muted")
         cookies_row.addWidget(QLabel("Cookies:"))
         cookies_row.addWidget(self.cookie_box)
         cookies_row.addWidget(self.cookie_file_label, stretch=1)
         layout.addLayout(cookies_row)
 
-        # --- Row 6: add to the queue ---
-        self.add_button = QPushButton("Add to queue")
+        # --- The main button ---
+        self.add_button = QPushButton("Download")
         self.add_button.setObjectName("primary")
+        self.add_button.setMinimumHeight(40)
         self.add_button.setEnabled(False)              # nothing fetched yet
         self.add_button.clicked.connect(self.on_add_clicked)
         layout.addWidget(self.add_button)
 
-        # --- The queue table ---
-        layout.addWidget(QLabel("Queue"))
+        layout.addStretch()
+        return page
+
+    def build_queue_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setSpacing(12)
+        layout.setContentsMargins(20, 20, 20, 20)
+
+        self.empty_label = QLabel("No downloads yet. Fetch a link in the Download tab.")
+        self.empty_label.setObjectName("muted")
+        self.empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.empty_label)
+
         self.table = make_table(["Title", "Status", "Size", "Speed", "Left", "Progress"])
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
@@ -274,37 +307,21 @@ class MainWindow(QMainWindow):
         self.table.itemSelectionChanged.connect(self.update_buttons)
         layout.addWidget(self.table, stretch=1)
 
-        queue_buttons = QHBoxLayout()
+        buttons = QHBoxLayout()
         self.pause_button = QPushButton("Pause")
         self.pause_button.clicked.connect(self.on_pause_clicked)
         self.cancel_button = QPushButton("Cancel")
         self.cancel_button.clicked.connect(self.on_cancel_clicked)
+        self.resume_all_button = QPushButton("Resume all")
+        self.resume_all_button.clicked.connect(self.on_resume_all_clicked)
         self.open_button = QPushButton("Open folder")
         self.open_button.clicked.connect(self.open_job_folder)
         self.clear_button = QPushButton("Clear finished")
         self.clear_button.clicked.connect(self.on_clear_clicked)
-        self.resume_all_button = QPushButton("Resume all")
-        self.resume_all_button.clicked.connect(self.on_resume_all_clicked)
         for button in (self.pause_button, self.cancel_button, self.resume_all_button,
                        self.open_button, self.clear_button):
-            queue_buttons.addWidget(button)
-        layout.addLayout(queue_buttons)
-
-        # --- Footer: status on the left, yt-dlp version + update check on the right ---
-        footer = QHBoxLayout()
-        self.status_label = QLabel("Ready")
-        self.notify_check = QCheckBox("Notify when done")
-        self.notify_check.setChecked(self.settings.value("ui/notify", True, type=bool))
-        self.notify_check.toggled.connect(lambda checked: self.settings.setValue("ui/notify", checked))
-        self.version_label = QLabel(f"yt-dlp {installed_version()}")
-        self.version_label.setStyleSheet("color: #9a9da3;")
-        self.update_button = QPushButton("Check for updates")
-        self.update_button.clicked.connect(self.on_update_clicked)
-        footer.addWidget(self.status_label, stretch=1)
-        footer.addWidget(self.notify_check)
-        footer.addWidget(self.version_label)
-        footer.addWidget(self.update_button)
-        layout.addLayout(footer)
+            buttons.addWidget(button)
+        layout.addLayout(buttons)
         return page
 
     def build_history_tab(self):
@@ -334,6 +351,75 @@ class MainWindow(QMainWindow):
         layout.addLayout(buttons)
         return page
 
+    def build_settings_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setSpacing(14)
+        layout.setContentsMargins(20, 20, 20, 20)
+
+        # --- Appearance ---
+        appearance = QGroupBox("Appearance")
+        form = QFormLayout(appearance)
+        self.theme_box = QComboBox()
+        self.theme_box.addItem("Dark", "dark")
+        self.theme_box.addItem("Light", "light")
+        saved_theme = self.settings.value("ui/theme", "dark")
+        self.theme_box.setCurrentIndex(max(self.theme_box.findData(saved_theme), 0))
+        self.theme_box.currentIndexChanged.connect(self.on_theme_changed)   # AFTER the initial value
+        form.addRow("Theme", self.theme_box)
+        layout.addWidget(appearance)
+
+        # --- Downloads ---
+        downloads = QGroupBox("Downloads")
+        form = QFormLayout(downloads)
+        self.parallel_spin = QSpinBox()
+        self.parallel_spin.setRange(1, MAX_PARALLEL)
+        self.parallel_spin.setValue(self.settings.value("downloads/parallel", 1, type=int))
+        self.parallel_spin.valueChanged.connect(self.on_parallel_changed)
+        form.addRow("Simultaneous downloads", self.parallel_spin)
+        hint = QLabel(
+            "How many downloads run at the same time. More is faster only if your connection "
+            "has room for it, and it can make some websites more likely to block you."
+        )
+        hint.setObjectName("muted")
+        hint.setWordWrap(True)
+        form.addRow(hint)
+        layout.addWidget(downloads)
+
+        # --- Notifications ---
+        notifications = QGroupBox("Notifications")
+        form = QFormLayout(notifications)
+        self.notify_check = QCheckBox("Notify me when a download finishes (if the window is in the background)")
+        self.notify_check.setChecked(self.settings.value("ui/notify", True, type=bool))
+        self.notify_check.toggled.connect(lambda checked: self.settings.setValue("ui/notify", checked))
+        form.addRow(self.notify_check)
+        layout.addWidget(notifications)
+
+        # --- yt-dlp ---
+        updates = QGroupBox("yt-dlp (the engine that talks to the websites)")
+        row = QHBoxLayout(updates)
+        self.version_label = QLabel(f"Installed version: {installed_version()}")
+        self.update_button = QPushButton("Check for updates")
+        self.update_button.clicked.connect(self.on_update_clicked)
+        row.addWidget(self.version_label, stretch=1)
+        row.addWidget(self.update_button)
+        layout.addWidget(updates)
+
+        layout.addStretch()
+        return page
+
+    # ============================================================
+    # Settings handlers
+    # ============================================================
+    def on_theme_changed(self, *_):
+        name = self.theme_box.currentData()
+        self.settings.setValue("ui/theme", name)
+        apply_theme(QApplication.instance(), name)       # switches live, no restart
+
+    def on_parallel_changed(self, value):
+        self.settings.setValue("downloads/parallel", value)
+        self.queue.set_max_parallel(value)               # takes effect immediately
+
     # ============================================================
     # Small helpers
     # ============================================================
@@ -347,6 +433,16 @@ class MainWindow(QMainWindow):
     def update_options(self, *_):
         # Quality only makes sense for video
         self.quality_box.setEnabled(self.video_radio.isChecked())
+
+    def update_extra_options(self, *_):
+        """Grey out the boxes of an option that isn't switched on."""
+        subs_on = self.subs_check.isChecked()
+        self.subs_edit.setEnabled(subs_on)
+        self.subs_auto_check.setEnabled(subs_on)
+
+        clip_on = self.clip_check.isChecked() and self.clip_check.isEnabled()
+        self.from_edit.setEnabled(clip_on)
+        self.to_edit.setEnabled(clip_on)
 
     def fill_qualities(self, heights):
         self.quality_box.clear()
@@ -470,6 +566,7 @@ class MainWindow(QMainWindow):
         self.show_thumbnail(thumbnail_bytes)
         self.choose_button.setVisible(info.is_playlist)
         self.refresh_meta()
+
         # Clipping makes no sense for a whole playlist
         self.clip_check.setEnabled(not info.is_playlist)
         if info.is_playlist:
@@ -480,13 +577,13 @@ class MainWindow(QMainWindow):
             self.fill_qualities(PRESET_HEIGHTS)
             message = (
                 f"Playlist with {info.entry_count} items. "
-                "Press 'Choose videos...' to pick some, or add them all."
+                "Press 'Choose videos...' to pick some, or download them all."
             )
         else:
             self.fill_qualities(info.heights)
-            message = "Ready. Choose your options and add it to the queue."
+            message = "Ready. Choose your options and press Download."
         self.set_busy(False, message)
-    
+
     def on_fetch_failed(self, message):
         self.title_label.setText("Paste a link and press Fetch")
         self.set_busy(False, "Something went wrong.")
@@ -521,99 +618,8 @@ class MainWindow(QMainWindow):
         self.selected_items = None if len(chosen) == len(self.info.entries) else chosen
         self.refresh_meta()
 
-    def update_extra_options(self, *_):
-        """Grey out the boxes of an option that isn't switched on."""
-        subs_on = self.subs_check.isChecked()
-        self.subs_edit.setEnabled(subs_on)
-        self.subs_auto_check.setEnabled(subs_on)
-
-        clip_on = self.clip_check.isChecked() and self.clip_check.isEnabled()
-        self.from_edit.setEnabled(clip_on)
-        self.to_edit.setEnabled(clip_on)
-
     # ============================================================
-    # Notifications
-    # ============================================================
-    def setup_tray(self):
-        """A system-tray icon: it is what lets us show Windows notifications."""
-        self.tray = None
-        if not QSystemTrayIcon.isSystemTrayAvailable():
-            return
-        icon = QApplication.windowIcon()
-        if icon.isNull():
-            icon = self.style().standardIcon(QStyle.StandardPixmap.SP_DialogApplyButton)
-        self.tray = QSystemTrayIcon(icon, self)
-        self.tray.setToolTip("Media Grabber")
-        self.tray.show()
-
-    def notify_done(self, job):
-        """Tell the user a download finished, but only when they aren't looking at the window."""
-        if self.tray is None or not self.notify_check.isChecked() or self.isActiveWindow():
-            return
-        still_busy = any(
-            j.state in (JobState.PENDING, JobState.DOWNLOADING) for j in self.queue.jobs
-        )
-        title = "Download finished" if still_busy else "All downloads finished"
-        self.tray.showMessage(title, job.title, QSystemTrayIcon.MessageIcon.Information, 6000)
-
-    def closeEvent(self, event):
-        """Qt calls this when the window is closing: save its size and position."""
-        self.settings.setValue("window/geometry", self.saveGeometry())
-        if self.tray is not None:
-            self.tray.hide()                  # so no ghost icon stays behind
-        super().closeEvent(event)
-    # ============================================================
-    # Tools check and yt-dlp updates
-    # ============================================================
-    def check_tools(self):
-        """Show a warning banner if a tool we depend on is missing."""
-        problems = []
-        if not find_tool("ffmpeg"):
-            problems.append(
-                "⚠ FFmpeg wasn't found, so downloads won't work. "
-                "Install it with:  winget install Gyan.FFmpeg  and restart the app."
-            )
-        if not find_tool("deno"):
-            problems.append(
-                "⚠ Deno wasn't found: some YouTube formats may be missing. "
-                "Install it with:  winget install DenoLand.Deno  and restart the app."
-            )
-        self.tools_label.setText("\n".join(problems))
-        self.tools_label.setVisible(bool(problems))
-
-    def on_update_clicked(self):
-        self.update_button.setEnabled(False)
-        self.status_label.setText("Checking for a newer yt-dlp...")
-
-        worker = Worker(latest_version)          # runs in the background: it uses the internet
-        worker.signals.finished.connect(self.on_update_checked)
-        self.update_worker = worker              # keep a reference
-        self.pool.start(worker)
-
-    def on_update_checked(self, latest):
-        self.update_button.setEnabled(True)
-        current = installed_version()
-
-        if latest is None:
-            self.status_label.setText("Couldn't check for updates (no internet?).")
-            return
-        if not is_newer(latest, current):
-            self.status_label.setText(f"yt-dlp is up to date ({current}).")
-            return
-
-        if getattr(sys, "frozen", False):        # the packaged .exe
-            how = "Rebuild the app with build.ps1: it installs the newest yt-dlp first."
-        else:                                    # running from source
-            how = 'Update it with:  pip install -U "yt-dlp[default]"'
-        QMessageBox.information(
-            self, "Media Grabber",
-            f"A newer yt-dlp is available: {latest} (you have {current}).\n\n{how}",
-        )
-        self.status_label.setText(f"Update available: yt-dlp {latest}")
-
-        
-    # ============================================================
-    # Step B: the queue
+    # Step B: the "Download" button puts a job in the queue
     # ============================================================
     def on_add_clicked(self):
         items = self.selected_items if self.info.is_playlist else None
@@ -652,7 +658,11 @@ class MainWindow(QMainWindow):
         count = len(items) if items else self.info.entry_count
         self.queue.add(request, self.info.title, item_count=count)
         self.status_label.setText("Added to the queue.")
+        self.tabs.setCurrentIndex(TAB_QUEUE)               # take the user to the progress
 
+    # ============================================================
+    # The Queue tab
+    # ============================================================
     def selected_job(self):
         """The job of the selected row, or None. Row N is always queue.jobs[N]."""
         row = self.table.currentRow()
@@ -676,6 +686,14 @@ class MainWindow(QMainWindow):
             any(j.state is JobState.PAUSED for j in self.queue.jobs)
         )
 
+        # A hint when the queue is empty, and a count in the tab's title
+        self.empty_label.setVisible(len(self.queue.jobs) == 0)
+        unfinished = sum(
+            1 for j in self.queue.jobs
+            if j.state in (JobState.PENDING, JobState.DOWNLOADING, JobState.PAUSED)
+        )
+        self.tabs.setTabText(TAB_QUEUE, f"Queue ({unfinished})" if unfinished else "Queue")
+
     def on_pause_clicked(self):
         job = self.selected_job()
         if job is None:
@@ -689,6 +707,11 @@ class MainWindow(QMainWindow):
         job = self.selected_job()
         if job is not None:
             self.queue.cancel(job)
+
+    def on_resume_all_clicked(self):
+        for job in list(self.queue.jobs):
+            if job.state is JobState.PAUSED:
+                self.queue.resume(job)
 
     def open_job_folder(self):
         job = self.selected_job()
@@ -736,13 +759,9 @@ class MainWindow(QMainWindow):
         if count:
             self.save_queue()
             self.status_label.setText(
-                f"Restored {count} unfinished download(s). Select one and press Resume, or Resume all."
+                f"Restored {count} unfinished download(s). Open the Queue tab and press Resume all."
             )
 
-    def on_resume_all_clicked(self):
-        for job in list(self.queue.jobs):
-            if job.state is JobState.PAUSED:
-                self.queue.resume(job)
     def ensure_row(self, row):
         """Make sure the table has a row number `row` (with its progress bar)."""
         while self.table.rowCount() <= row:
@@ -913,7 +932,7 @@ class MainWindow(QMainWindow):
         )
         item_count = len(items) if items else (entry.file_count if entry.playlist else 1)
         self.queue.add(request, entry.title, item_count=item_count)
-        self.tabs.setCurrentIndex(0)               # jump to the Downloads tab
+        self.tabs.setCurrentIndex(TAB_QUEUE)       # jump to the progress
         self.status_label.setText("Added to the queue.")
 
     def on_history_clear_clicked(self):
@@ -925,3 +944,83 @@ class MainWindow(QMainWindow):
         except HistoryError as e:
             QMessageBox.warning(self, "Media Grabber", str(e))
         self.refresh_history_table()
+
+    # ============================================================
+    # Tools check and yt-dlp updates
+    # ============================================================
+    def check_tools(self):
+        """Show a warning banner if a tool we depend on is missing."""
+        problems = []
+        if not find_tool("ffmpeg"):
+            problems.append(
+                "⚠ FFmpeg wasn't found, so downloads won't work. "
+                "Install it with:  winget install Gyan.FFmpeg  and restart the app."
+            )
+        if not find_tool("deno"):
+            problems.append(
+                "⚠ Deno wasn't found: some YouTube formats may be missing. "
+                "Install it with:  winget install DenoLand.Deno  and restart the app."
+            )
+        self.tools_label.setText("\n".join(problems))
+        self.tools_label.setVisible(bool(problems))
+
+    def on_update_clicked(self):
+        self.update_button.setEnabled(False)
+        self.status_label.setText("Checking for a newer yt-dlp...")
+
+        worker = Worker(latest_version)          # runs in the background: it uses the internet
+        worker.signals.finished.connect(self.on_update_checked)
+        self.update_worker = worker              # keep a reference
+        self.pool.start(worker)
+
+    def on_update_checked(self, latest):
+        self.update_button.setEnabled(True)
+        current = installed_version()
+
+        if latest is None:
+            self.status_label.setText("Couldn't check for updates (no internet?).")
+            return
+        if not is_newer(latest, current):
+            self.status_label.setText(f"yt-dlp is up to date ({current}).")
+            return
+
+        if getattr(sys, "frozen", False):        # the packaged .exe
+            how = "Rebuild the app with build.ps1: it installs the newest yt-dlp first."
+        else:                                    # running from source
+            how = 'Update it with:  pip install -U "yt-dlp[default]"'
+        QMessageBox.information(
+            self, "Media Grabber",
+            f"A newer yt-dlp is available: {latest} (you have {current}).\n\n{how}",
+        )
+        self.status_label.setText(f"Update available: yt-dlp {latest}")
+
+    # ============================================================
+    # Notifications
+    # ============================================================
+    def setup_tray(self):
+        """A system-tray icon: it is what lets us show Windows notifications."""
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        icon = QApplication.windowIcon()
+        if icon.isNull():
+            icon = self.style().standardIcon(QStyle.StandardPixmap.SP_DialogApplyButton)
+        self.tray = QSystemTrayIcon(icon, self)
+        self.tray.setToolTip("Media Grabber")
+        self.tray.show()
+
+    def notify_done(self, job):
+        """Tell the user a download finished, but only when they aren't looking at the window."""
+        if self.tray is None or not self.notify_check.isChecked() or self.isActiveWindow():
+            return
+        still_busy = any(
+            j.state in (JobState.PENDING, JobState.DOWNLOADING) for j in self.queue.jobs
+        )
+        title = "Download finished" if still_busy else "All downloads finished"
+        self.tray.showMessage(title, job.title, QSystemTrayIcon.MessageIcon.Information, 6000)
+
+    def closeEvent(self, event):
+        """Qt calls this when the window is closing: save its size and position."""
+        self.settings.setValue("window/geometry", self.saveGeometry())
+        if self.tray is not None:
+            self.tray.hide()                  # so no ghost icon stays behind
+        super().closeEvent(event)
