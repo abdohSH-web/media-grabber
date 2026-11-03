@@ -18,6 +18,10 @@ class HistoryEntry:
     finished_at: str           # ISO text, e.g. "2026-11-01T14:30:05"
     file_count: int
     items: list[int] | None = None   # chosen playlist positions (None = the whole playlist)
+    subtitles: list[str] | None = None
+    auto_subtitles: bool = True
+    clip_start: float | None = None
+    clip_end: float | None = None
 
 
 class HistoryStore:

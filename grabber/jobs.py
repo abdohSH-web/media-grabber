@@ -55,11 +55,17 @@ class DownloadQueue:
     # ------------------------------------------------------------
     # Commands (called by the UI, from any thread)
     # ------------------------------------------------------------
-    def add(self, request, title, item_count=1):
+    def add(self, request, title, item_count=1, paused=False):
+        """paused=True: the job waits in the list until the user resumes it.
+        (Used when restoring the queue from the last session.)"""
         job = DownloadJob(request, title, item_count)
+        if paused:
+            job.state = JobState.PAUSED
+            job.message = "Restored from the last session"
         with self._condition:
             self.jobs.append(job)
-            self._condition.notify()          # wake the worker: there is something to do
+            if not paused:
+                self._condition.notify()          # wake the worker: there is something to do
         self.on_change(job)
         return job
 

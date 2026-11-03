@@ -28,7 +28,8 @@ from PySide6.QtWidgets import (
 )
 
 from grabber.downloader import Downloader
-from grabber.errors import HistoryError
+from grabber.errors import HistoryError, QueueStoreError
+from grabber.queue_store import QueueStore
 from grabber.history import HistoryEntry, HistoryStore
 from grabber.jobs import DownloadQueue, JobState
 from grabber.models import CookieSettings, DownloadRequest, Mode
@@ -75,24 +76,28 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Media Grabber")
-        self.resize(1000, 780)
+        self.resize(1000, 800)
 
         self.downloader = Downloader()
         self.pool = QThreadPool.globalInstance()   # used for fetching info
         self.info = None              # MediaInfo of the last fetched link (None = nothing ready)
         self.selected_items = None    # chosen playlist positions (None = the whole playlist)
         self.fetch_worker = None      # we keep a reference so Python doesn't delete it
+        self.update_worker = None
 
         # The queue runs in its own Python thread. The bridge hands its updates to Qt safely.
         self.bridge = QueueBridge()
         self.bridge.changed.connect(self.on_job_changed)
         self.queue = DownloadQueue(self.downloader, on_change=self.bridge.changed.emit)
 
-        # The history file lives in the app's data folder (on Windows: inside AppData)
+        # Our files live in the app's data folder (on Windows: inside AppData)
         data_dir = Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation))
         self.history = HistoryStore(data_dir / "history.json")
+        self.queue_store = QueueStore(data_dir / "queue.json")
         self.history_entries = []     # what the History table currently shows
         self.recorded = set()         # ids of jobs already written to the history
+        self.last_states = {}         # job id -> its last known state (to spot real changes)
+        self.restoring = False
 
         # QSettings remembers small settings between runs (on Windows: in the registry)
         self.settings = QSettings("MediaGrabber", "MediaGrabber")
@@ -101,6 +106,7 @@ class MainWindow(QMainWindow):
         self.build_ui()
         self.load_cookie_settings()
         self.refresh_history_table()
+        self.restore_queue()
         self.update_buttons()
         self.check_tools()
 
@@ -247,7 +253,10 @@ class MainWindow(QMainWindow):
         self.open_button.clicked.connect(self.open_job_folder)
         self.clear_button = QPushButton("Clear finished")
         self.clear_button.clicked.connect(self.on_clear_clicked)
-        for button in (self.pause_button, self.cancel_button, self.open_button, self.clear_button):
+        self.resume_all_button = QPushButton("Resume all")
+        self.resume_all_button.clicked.connect(self.on_resume_all_clicked)
+        for button in (self.pause_button, self.cancel_button, self.resume_all_button,
+                       self.open_button, self.clear_button):
             queue_buttons.addWidget(button)
         layout.addLayout(queue_buttons)
 
@@ -567,6 +576,9 @@ class MainWindow(QMainWindow):
             state in (JobState.PENDING, JobState.DOWNLOADING, JobState.PAUSED)
         )
         self.open_button.setEnabled(job is not None)
+        self.resume_all_button.setEnabled(
+            any(j.state is JobState.PAUSED for j in self.queue.jobs)
+        )
 
     def on_pause_clicked(self):
         job = self.selected_job()
@@ -597,11 +609,43 @@ class MainWindow(QMainWindow):
         self.update_row(job)
         self.update_buttons()
 
+        # Save the queue only when a job APPEARS or CHANGES STATE (not on every progress tick)
+        previous_state = self.last_states.get(job.id)
+        self.last_states[job.id] = job.state
+        if job.state is not previous_state and not self.restoring:
+            self.save_queue()
+
         # A finished job is written to the history exactly once
         if job.state is JobState.DONE and job.id not in self.recorded:
             self.recorded.add(job.id)
             self.record_history(job)
 
+    def save_queue(self):
+        try:
+            self.queue_store.save(self.queue.jobs)
+        except QueueStoreError as e:
+            self.status_label.setText(f"Couldn't save the queue: {e}")
+
+    def restore_queue(self):
+        """Bring back the unfinished jobs of the last session, PAUSED."""
+        self.restoring = True
+        try:
+            for request, title, item_count in self.queue_store.load():
+                self.queue.add(request, title, item_count, paused=True)
+        finally:
+            self.restoring = False
+
+        count = len(self.queue.jobs)
+        if count:
+            self.save_queue()
+            self.status_label.setText(
+                f"Restored {count} unfinished download(s). Select one and press Resume, or Resume all."
+            )
+
+    def on_resume_all_clicked(self):
+        for job in list(self.queue.jobs):
+            if job.state is JobState.PAUSED:
+                self.queue.resume(job)
     def ensure_row(self, row):
         """Make sure the table has a row number `row` (with its progress bar)."""
         while self.table.rowCount() <= row:

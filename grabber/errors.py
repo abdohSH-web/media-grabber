@@ -37,3 +37,7 @@ class UserCancelledError(GrabberError):
 
 class HistoryError(GrabberError):
     """The download history couldn't be saved."""
+
+
+class QueueStoreError(GrabberError):
+    """The unfinished queue couldn't be saved."""

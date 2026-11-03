@@ -43,7 +43,14 @@ class DownloadRequest:
     max_height: int | None = None        # None = the best quality available
     playlist: bool = False
     items: tuple[int, ...] | None = None  # playlist positions to download (None = all)
+    subtitles: tuple[str, ...] = ()       # language codes like ("en", "ar"); empty = none
+    auto_subtitles: bool = True           # also accept auto-generated subtitles
+    clip_start: float | None = None       # seconds. When set: download only a part
+    clip_end: float | None = None         # seconds. None = until the end
 
+    @property
+    def has_clip(self):
+        return self.clip_start is not None
 
 @dataclass(frozen=True)
 class Progress:
