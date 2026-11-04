@@ -22,6 +22,7 @@ class HistoryEntry:
     auto_subtitles: bool = True
     clip_start: float | None = None
     clip_end: float | None = None
+    name_prefix: str = ""
 
 
 class HistoryStore:

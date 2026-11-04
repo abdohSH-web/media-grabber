@@ -34,6 +34,7 @@ class DownloadJob:
         self.message = ""              # error text or a short note
         self.files = ()                # filled when the job is DONE
         self.size_bytes = None         # total size on disk, filled when the job is DONE
+        self.reused = False            # True if the file already existed (nothing new saved)
         self._stop_event = threading.Event()
         self._stop_reason = None       # "pause" or "cancel"
 
@@ -178,6 +179,7 @@ class DownloadQueue:
         else:
             job.files = result.files
             job.size_bytes = self._total_size(result.files)
+            job.reused = bool(result.files) and len(result.reused) == len(result.files)
             self._finish(job, JobState.DONE, "")
 
     @staticmethod

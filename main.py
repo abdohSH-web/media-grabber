@@ -10,6 +10,7 @@ from grabber.tools import use_bundled_tools
 from ui.main_window import MainWindow
 from ui.paths import resource_path
 from ui.theme import apply_theme
+from ui.i18n import apply_language, default_language
 
 
 def data_folder():
@@ -43,6 +44,7 @@ def main():
     # The theme the user chose last time (dark by default)
     settings = QSettings("MediaGrabber", "MediaGrabber")
     apply_theme(app, settings.value("ui/theme", "dark"))
+    apply_language(app, settings.value("ui/language", default_language()))
 
     # The icon is optional: if the file isn't there, the app uses the default one
     icon_file = resource_path("assets/icon.png")

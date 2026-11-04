@@ -13,7 +13,7 @@ def make_request(**changes):
 def test_a_request_survives_the_round_trip():
     request = make_request(
         mode=Mode.AUDIO, max_height=720, playlist=True, items=(1, 3),
-        subtitles=("en", "ar"), auto_subtitles=False, clip_start=5.0, clip_end=12.0,
+        subtitles=("en", "ar"), auto_subtitles=False, clip_start=5.0, clip_end=12.0, name_prefix="03 - ",
     )
     assert request_from_dict(request_to_dict(request)) == request
 

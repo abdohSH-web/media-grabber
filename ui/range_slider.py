@@ -16,6 +16,7 @@ class RangeSlider(QWidget):
 
     def __init__(self, duration, start=0, end=None, parent=None):
         super().__init__(parent)
+        self.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
         self.duration = max(int(duration), 1)
         self.start = int(start)
         self.end = int(end) if end is not None else self.duration

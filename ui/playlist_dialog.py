@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
 )
 
 from .formatting import format_duration
+from .i18n import tr
 
 
 class PlaylistDialog(QDialog):
@@ -20,7 +21,7 @@ class PlaylistDialog(QDialog):
         """entries : tuple of PlaylistEntry
         selected   : tuple of positions that start checked (None = all of them)"""
         super().__init__(parent)
-        self.setWindowTitle("Choose videos")
+        self.setWindowTitle(tr("dlg_choose_videos"))
         self.resize(600, 620)
 
         layout = QVBoxLayout(self)
@@ -37,17 +38,16 @@ class PlaylistDialog(QDialog):
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             is_checked = selected is None or entry.index in selected
             item.setCheckState(Qt.CheckState.Checked if is_checked else Qt.CheckState.Unchecked)
-            # Hide the playlist position inside the item, so we can read it back later
-            item.setData(Qt.ItemDataRole.UserRole, entry.index)
+            item.setData(Qt.ItemDataRole.UserRole, entry.index)   # the position, hidden inside
             self.list_widget.addItem(item)
 
         self.list_widget.itemChanged.connect(self.update_counter)
         layout.addWidget(self.list_widget, stretch=1)
 
         quick_row = QHBoxLayout()
-        select_all = QPushButton("Select all")
+        select_all = QPushButton(tr("btn_select_all"))
         select_all.clicked.connect(lambda: self.set_all(Qt.CheckState.Checked))
-        select_none = QPushButton("Select none")
+        select_none = QPushButton(tr("btn_select_none"))
         select_none.clicked.connect(lambda: self.set_all(Qt.CheckState.Unchecked))
         quick_row.addWidget(select_all)
         quick_row.addWidget(select_none)
@@ -57,8 +57,10 @@ class PlaylistDialog(QDialog):
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
-        buttons.accepted.connect(self.accept)     # OK
-        buttons.rejected.connect(self.reject)     # Cancel
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText(tr("btn_ok"))
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText(tr("btn_cancel"))
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
         self.update_counter()
@@ -77,6 +79,6 @@ class PlaylistDialog(QDialog):
         return tuple(chosen)
 
     def update_counter(self, *_):
-        self.counter_label.setText(
-            f"{len(self.selected_indices())} of {self.list_widget.count()} videos selected"
-        )
+        self.counter_label.setText(tr(
+            "plist_counter", chosen=len(self.selected_indices()), total=self.list_widget.count()
+        ))

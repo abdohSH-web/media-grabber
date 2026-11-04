@@ -1,3 +1,4 @@
+import time
 import os
 from pathlib import Path
 from urllib.parse import urlparse
@@ -106,14 +107,24 @@ def _final_paths(info):
                 paths.append(path)
     return paths
 
-def _clip_label(start, end):
-    """(65, 130) -> '01m05s-02m10s'. Goes into the file name, so a clip never
-    replaces (or gets skipped because of) the full video in the same folder."""
-    def part(seconds):
-        minutes, secs = divmod(int(seconds), 60)
-        return f"{minutes:02d}m{secs:02d}s"
 
-    return f"{part(start)}-{part(end)}" if end is not None else f"{part(start)}-end"
+def _entry_url(entry):
+    """The link of one playlist entry (from the fast 'flat' listing), or "" if none."""
+    url = entry.get("url") or entry.get("webpage_url") or ""
+    if url.startswith(("http://", "https://")):
+        return url
+    video_id = entry.get("id")
+    if video_id and (entry.get("ie_key") or "").lower() == "youtube":
+        return f"https://www.youtube.com/watch?v={video_id}"
+    return ""
+
+
+def _existed_before(path, started):
+    """True if the file is older than this download: yt-dlp found it and skipped it."""
+    try:
+        return path.stat().st_mtime < started - 1
+    except OSError:
+        return False
 
 
 class Downloader:
@@ -166,7 +177,9 @@ class Downloader:
         if is_playlist:
             # enumerate BEFORE dropping empty entries: positions must match the playlist
             entries = tuple(
-                PlaylistEntry(index, entry.get("title") or "Untitled", entry.get("duration"))
+                PlaylistEntry(
+                    index, entry.get("title") or "Untitled", entry.get("duration"), _entry_url(entry)
+                )
                 for index, entry in enumerate(list(raw_entries), start=1)
                 if entry
             )
@@ -265,6 +278,7 @@ class Downloader:
                         "processing", 100.0, None, None, d.get("filename", ""), item_index,
                     ))
 
+        started = time.time()
         try:
             options = self._build_options(request, hook)
             with YoutubeDL(options) as ydl:
@@ -279,18 +293,21 @@ class Downloader:
         if on_progress:
             on_progress(Progress("finished", 100.0, None, None, ""))
 
-        return DownloadResult(files=tuple(Path(p) for p in _final_paths(info)))
+        files = tuple(Path(p) for p in _final_paths(info))
+        reused = tuple(path for path in files if _existed_before(path, started))
+        return DownloadResult(files=files, reused=reused)
 
     def _build_options(self, request, hook):
         """Translate OUR request into yt-dlp's options dictionary."""
         folder = Path(request.folder)
         folder.mkdir(parents=True, exist_ok=True)
 
-        # File name = title + (clip range) + (quality), like "My video [01m05s-02m10s] [720p].mp4"
+        # File name = the title plus the real quality: "My video [720p].mp4".
         # "%(height& [{}p]|)s" means: if the video has a height, write " [720p]", else nothing.
         quality = "" if request.mode is Mode.AUDIO else "%(height& [{}p]|)s"
-        clip = f" [{_clip_label(request.clip_start, request.clip_end)}]" if request.has_clip else ""
-        name = f"%(title)s{clip}{quality}.%(ext)s"
+        # name_prefix is plain text (like "03 - " for playlist videos): a "%" must be doubled
+        prefix = request.name_prefix.replace("%", "%%")
+        name = f"{prefix}%(title)s{quality}.%(ext)s"
 
         if request.playlist:
             # A subfolder per playlist, files numbered by their place in the playlist
@@ -306,6 +323,7 @@ class Downloader:
             "logger": _logger(),
             "windowsfilenames": True,            # no characters Windows forbids
             "trim_file_name": 150,               # very long titles are shortened
+            "updatetime": False,                 # keep the file's date = when WE saved it               
             "ffmpeg_location": self.ffmpeg,
             "progress_hooks": [hook],
         }

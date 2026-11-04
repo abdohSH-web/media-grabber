@@ -23,6 +23,7 @@ def request_to_dict(request):
         "auto_subtitles": request.auto_subtitles,
         "clip_start": request.clip_start,
         "clip_end": request.clip_end,
+        "name_prefix": request.name_prefix,
     }
 
 
@@ -41,6 +42,7 @@ def request_from_dict(data):
         auto_subtitles=bool(data.get("auto_subtitles", True)),
         clip_start=data.get("clip_start"),
         clip_end=data.get("clip_end"),
+        name_prefix=data.get("name_prefix", ""),
     )
 
 

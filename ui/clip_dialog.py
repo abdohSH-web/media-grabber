@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
 )
 
 from .formatting import format_duration
+from .i18n import tr
 from .parsing import parse_time
 from .range_slider import RangeSlider
 
@@ -18,13 +19,13 @@ class ClipDialog(QDialog):
 
     def __init__(self, duration, start=None, end=None, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Choose the part to download")
+        self.setWindowTitle(tr("dlg_clip_title"))
         self.resize(580, 270)
         self.duration = int(duration)
 
         layout = QVBoxLayout(self)
         layout.setSpacing(14)
-        layout.addWidget(QLabel(f"Video length: {format_duration(self.duration)}"))
+        layout.addWidget(QLabel(tr("clip_video_length", length=format_duration(self.duration))))
 
         self.slider = RangeSlider(self.duration, start or 0, end)
         layout.addWidget(self.slider)
@@ -32,9 +33,9 @@ class ClipDialog(QDialog):
         times_row = QHBoxLayout()
         self.from_edit = QLineEdit()
         self.to_edit = QLineEdit()
-        times_row.addWidget(QLabel("From"))
+        times_row.addWidget(QLabel(tr("lbl_from")))
         times_row.addWidget(self.from_edit)
-        times_row.addWidget(QLabel("To"))
+        times_row.addWidget(QLabel(tr("lbl_to")))
         times_row.addWidget(self.to_edit)
         layout.addLayout(times_row)
 
@@ -42,13 +43,15 @@ class ClipDialog(QDialog):
         self.summary_label.setObjectName("muted")
         layout.addWidget(self.summary_label)
 
-        whole_button = QPushButton("Use the whole video")
+        whole_button = QPushButton(tr("btn_whole_video"))
         whole_button.clicked.connect(self.use_whole_video)
         layout.addWidget(whole_button)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText(tr("btn_ok"))
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText(tr("btn_cancel"))
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
@@ -63,10 +66,11 @@ class ClipDialog(QDialog):
         """Write the range in the text boxes and in the summary line."""
         self.from_edit.setText(format_duration(start))
         self.to_edit.setText(format_duration(end))
-        self.summary_label.setText(
-            f"Selected: {format_duration(start)} → {format_duration(end)}"
-            f"   ({format_duration(end - start)} long)"
-        )
+        self.summary_label.setText(tr(
+            "clip_summary",
+            start=format_duration(start), end=format_duration(end),
+            length=format_duration(end - start),
+        ))
 
     def on_text_edited(self):
         try:

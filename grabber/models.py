@@ -18,6 +18,7 @@ class PlaylistEntry:
     index: int                           # position in the playlist, starting at 1
     title: str
     duration_seconds: int | None
+    url: str = ""                        # the video's own link ("" if we couldn't find one)
 
 
 @dataclass(frozen=True)
@@ -47,10 +48,12 @@ class DownloadRequest:
     auto_subtitles: bool = True           # also accept auto-generated subtitles
     clip_start: float | None = None       # seconds. When set: download only a part
     clip_end: float | None = None         # seconds. None = until the end
+    name_prefix: str = ""                 # text put before the file name, like "03 - "
 
     @property
     def has_clip(self):
         return self.clip_start is not None
+
 
 @dataclass(frozen=True)
 class Progress:
@@ -68,6 +71,7 @@ class Progress:
 @dataclass(frozen=True)
 class DownloadResult:
     files: tuple[Path, ...]
+    reused: tuple[Path, ...] = ()        # files that already existed: nothing new was saved
 
 
 @dataclass(frozen=True)
