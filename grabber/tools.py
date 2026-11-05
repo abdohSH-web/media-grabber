@@ -11,12 +11,21 @@ def app_folder():
     return Path(__file__).resolve().parent.parent
 
 
-def use_bundled_tools():
-    """If a 'bin' folder sits next to the app (holding ffmpeg.exe, deno.exe...),
-    put it FIRST on the PATH. Every search for a tool, ours and yt-dlp's, then finds it."""
-    bin_folder = app_folder() / "bin"
-    if bin_folder.is_dir():
-        os.environ["PATH"] = str(bin_folder) + os.pathsep + os.environ.get("PATH", "")
+def add_to_path(folder):
+    """Put `folder` first on the PATH of this program (and of the programs it starts,
+    like yt-dlp looking for Deno)."""
+    folder = str(folder)
+    current = os.environ.get("PATH", "")
+    if folder not in current.split(os.pathsep):
+        os.environ["PATH"] = folder + os.pathsep + current
+
+
+def use_bundled_tools(extra_folders=()):
+    """Make tools that sit next to the app (a 'bin' folder) or in our own tools
+    folder findable. Folders that don't exist are ignored."""
+    for folder in (app_folder() / "bin", *extra_folders):
+        if Path(folder).is_dir():
+            add_to_path(folder)
 
 
 def find_tool(name):

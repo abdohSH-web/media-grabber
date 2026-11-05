@@ -55,34 +55,30 @@ def validate_url(url):
     url = (url or "").strip()
     parts = urlparse(url)
     if parts.scheme not in ("http", "https") or not parts.netloc:
-        raise InvalidUrlError(f"This doesn't look like a web address: {url!r}")
+        raise InvalidUrlError(f"This doesn't look like a web address: {url!r}", url=url)
     return url
 
 
 def _translate_error(error):
     """Turn a yt-dlp error into one of OUR errors, by reading its message.
-    This is a best-effort guess: unknown messages become DownloadFailedError."""
+    This is a best-effort guess: unknown messages become DownloadFailedError.
+    The wording the USER sees comes from the translations (err_<code>)."""
     message = str(error).replace("ERROR: ", "", 1)
     lowered = message.lower()
 
     if "unsupported url" in lowered:
-        return InvalidUrlError("This link or website isn't supported.")
+        return InvalidUrlError("This link or website isn't supported.", code="unsupported_url")
 
     # Check this BEFORE the cookie check: YouTube's own message mentions "cookies"
     if "not a bot" in lowered:
         return VerificationRequiredError(
-            "YouTube is asking to verify that you're not a bot.\n\n"
-            "Fix: under 'Cookies', choose a browser where you are signed in to YouTube "
-            "(Firefox works best on Windows) or a cookies.txt file, then try again."
+            "YouTube is asking to verify that you're not a bot. Under 'Cookies', choose a "
+            "browser where you are signed in to YouTube, or a cookies.txt file."
         )
 
     cookie_trouble = ("could not copy", "decrypt", "database", "failed to", "not found")
     if ("cookie" in lowered or "dpapi" in lowered) and any(word in lowered for word in cookie_trouble):
-        return CookieProblemError(
-            "Couldn't read the cookies. Close that browser completely and try again.\n"
-            "On Windows, Chrome and Edge often block this: Firefox or a cookies.txt "
-            f"file works better.\n\nDetails: {message}"
-        )
+        return CookieProblemError(f"Couldn't read the cookies: {message}")
 
     unavailable_markers = (
         "private video", "video unavailable", "not available",
@@ -134,6 +130,10 @@ class Downloader:
     def __init__(self, cookies=None):
         self.ffmpeg = find_tool("ffmpeg")              # full path, or None
         self.cookies = cookies or CookieSettings()     # the UI may replace this any time
+
+    def refresh_tools(self):
+        """Look for FFmpeg again (after the 'Download tools' button installed it)."""
+        self.ffmpeg = find_tool("ffmpeg")
 
     def _apply_cookies(self, options):
         """Add the cookie settings (if any) to a yt-dlp options dictionary."""
@@ -288,7 +288,8 @@ class Downloader:
         except YoutubeDLError as e:
             raise _translate_error(e) from e
         except OSError as e:
-            raise DownloadFailedError(f"File problem: {e}") from e
+            raise DownloadFailedError(f"File problem: {e}", code="file_problem", reason=str(e)) from e
+
 
         if on_progress:
             on_progress(Progress("finished", 100.0, None, None, ""))

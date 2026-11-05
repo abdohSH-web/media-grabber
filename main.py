@@ -39,8 +39,8 @@ def main():
     app.setApplicationName("MediaGrabber")
 
     redirect_output_to_log()         # after the names: they decide the folder
-    use_bundled_tools()              # BEFORE the window: it looks for FFmpeg when it starts
-
+    use_bundled_tools([data_folder() / "tools"])   # BEFORE the window: it looks for FFmpeg when it starts
+    
     # The theme the user chose last time (dark by default)
     settings = QSettings("MediaGrabber", "MediaGrabber")
     apply_theme(app, settings.value("ui/theme", "dark"))

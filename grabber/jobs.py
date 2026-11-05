@@ -32,6 +32,7 @@ class DownloadJob:
         self.state = JobState.PENDING
         self.progress = None           # the latest Progress object (or None)
         self.message = ""              # error text or a short note
+        self.error = None              # the error object, when the job FAILED
         self.files = ()                # filled when the job is DONE
         self.size_bytes = None         # total size on disk, filled when the job is DONE
         self.reused = False            # True if the file already existed (nothing new saved)
@@ -172,10 +173,11 @@ class DownloadQueue:
             else:
                 self._finish(job, JobState.CANCELLED, "Cancelled")
         except GrabberError as e:
-            self._finish(job, JobState.FAILED, str(e))
+            self._finish(job, JobState.FAILED, str(e), e)
         except Exception as e:
             traceback.print_exc()             # a real bug: show everything in the log
-            self._finish(job, JobState.FAILED, f"Unexpected error: {e}")
+            error = GrabberError(f"Unexpected error: {e}", code="unexpected", reason=str(e))
+            self._finish(job, JobState.FAILED, str(error), error)
         else:
             job.files = result.files
             job.size_bytes = self._total_size(result.files)
@@ -193,10 +195,11 @@ class DownloadQueue:
                 pass
         return total or None
 
-    def _finish(self, job, state, message):
+    def _finish(self, job, state, message, error=None):
         with self._condition:
             job.state = state
             job.message = message
+            job.error = error
             self._active -= 1                 # this job no longer uses a slot
             self._condition.notify_all()      # a slot is free: another job may start
         self.on_change(job)

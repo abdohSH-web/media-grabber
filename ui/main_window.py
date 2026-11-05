@@ -39,12 +39,14 @@ from grabber.jobs import MAX_PARALLEL, DownloadQueue, JobState
 from grabber.models import CookieSettings, DownloadRequest, Mode
 from grabber.naming import safe_folder_name
 from grabber.queue_store import QueueStore
-from grabber.tools import find_tool
+from grabber.tools import add_to_path, find_tool
+from grabber.toolsetup import install_tools, missing_tools
+from grabber.version import APP_VERSION
 from grabber.updates import installed_version, is_newer, latest_version
 
 from .clip_dialog import ClipDialog
 from .formatting import format_duration, format_eta, format_size, format_speed
-from .i18n import LANGUAGES, apply_language, current_language, tr
+from .i18n import LANGUAGES, apply_language, current_language, tr, error_text
 from .parsing import parse_languages
 from .playlist_dialog import PlaylistDialog
 from .theme import apply_theme
@@ -52,6 +54,8 @@ from .workers import QueueBridge, Worker, load_thumbnail
 
 # Quality choices offered for playlists (each video has its own list of heights)
 PRESET_HEIGHTS = (1080, 720, 480, 360)
+
+TOOL_LABELS = {"ffmpeg": "FFmpeg", "deno": "Deno"}
 
 # The tabs, in order
 TAB_DOWNLOAD, TAB_QUEUE, TAB_HISTORY, TAB_SETTINGS = range(4)
@@ -111,6 +115,8 @@ class MainWindow(QMainWindow):
         self.clip_range = None        # (start, end) in seconds chosen in the clip window, or None
         self.fetch_worker = None      # we keep references so Python doesn't delete them
         self.update_worker = None
+        self.tools_busy = False       # True while FFmpeg / Deno are being downloaded
+        self.tools_worker = None
 
         # The queue runs in its own Python threads. The bridge hands its updates to Qt safely.
         self.bridge = QueueBridge()
@@ -119,6 +125,7 @@ class MainWindow(QMainWindow):
 
         # Our files live in the app's data folder (on Windows: inside AppData)
         data_dir = Path(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.AppDataLocation))
+        self.tools_folder = data_dir / "tools"    # where "Download tools" puts FFmpeg and Deno
         self.history = HistoryStore(data_dir / "history.json")
         self.queue_store = QueueStore(data_dir / "queue.json")
         self.history_entries = []     # what the History table currently shows
@@ -250,12 +257,18 @@ class MainWindow(QMainWindow):
         layout.setSpacing(12)
         layout.setContentsMargins(20, 20, 20, 20)
 
-        # A warning banner: only visible when FFmpeg or Deno is missing
+        # A warning banner with a button: only visible when FFmpeg or Deno is missing
+        tools_row = QHBoxLayout()
         self.tools_label = QLabel("")
         self.tools_label.setObjectName("warning")
         self.tools_label.setWordWrap(True)
+        self.tools_button = self.button("btn_download_tools")
+        self.tools_button.clicked.connect(self.on_download_tools_clicked)
         self.tools_label.setVisible(False)
-        layout.addWidget(self.tools_label)
+        self.tools_button.setVisible(False)
+        tools_row.addWidget(self.tools_label, stretch=1)
+        tools_row.addWidget(self.tools_button)
+        layout.addLayout(tools_row)
 
         # --- Row 1: the link + Paste + Fetch buttons ---
         link_row = QHBoxLayout()
@@ -509,7 +522,24 @@ class MainWindow(QMainWindow):
         row.addWidget(self.version_label, stretch=1)
         row.addWidget(self.update_button)
         layout.addWidget(updates)
+        # --- Required tools ---
+        tools = QGroupBox()
+        self.bind(tools.setTitle, "grp_tools")
+        form = QFormLayout(tools)
+        self.ffmpeg_status = QLabel()
+        self.deno_status = QLabel()
+        form.addRow("FFmpeg", self.ffmpeg_status)
+        form.addRow("Deno", self.deno_status)
+        self.tools_download_button = self.button("btn_download_tools")
+        self.tools_download_button.clicked.connect(self.on_download_tools_clicked)
+        form.addRow(self.tools_download_button)
+        layout.addWidget(tools)
 
+        about = QLabel()
+        about.setObjectName("muted")
+        self.bind(about.setText, "lbl_about", version=APP_VERSION)
+        layout.addWidget(about)
+        
         layout.addStretch()
         return page
 
@@ -719,11 +749,11 @@ class MainWindow(QMainWindow):
             message = tr("status_ready_single")
         self.set_busy(False, message)
 
-    def on_fetch_failed(self, message):
+    def on_fetch_failed(self, error):
         self.loading = False
         self.refresh_title()
         self.set_busy(False, tr("status_error"))
-        self.warn(message)                     # the engine's message (English for now)
+        self.warn(error_text(error))           # translated when the error has a code
 
     def on_paste_clicked(self):
         text = QApplication.clipboard().text().strip()
@@ -986,7 +1016,10 @@ class MainWindow(QMainWindow):
         )
         for column, text in enumerate(texts):
             self.table.item(row, column).setText(text)
-        self.table.item(row, 1).setToolTip(job.message if job.state is JobState.FAILED else "")
+        tip = ""
+        if job.state is JobState.FAILED:
+            tip = error_text(job.error) if job.error else job.message
+        self.table.item(row, 1).setToolTip(tip)
         self.table.cellWidget(row, 5).setValue(int(self.job_percent(job)))
 
     def rebuild_table(self):
@@ -1152,7 +1185,7 @@ class MainWindow(QMainWindow):
     # Tools check and yt-dlp updates
     # ============================================================
     def check_tools(self):
-        """Show a warning banner if a tool we depend on is missing."""
+        """Show a warning banner (with a Download button) if a tool is missing."""
         problems = []
         if not find_tool("ffmpeg"):
             problems.append(tr("tools_ffmpeg_missing"))
@@ -1160,7 +1193,51 @@ class MainWindow(QMainWindow):
             problems.append(tr("tools_deno_missing"))
         self.tools_label.setText("\n".join(problems))
         self.tools_label.setVisible(bool(problems))
+        self.tools_button.setVisible(bool(problems))
+        self.refresh_tools_status()
 
+    def refresh_tools_status(self):
+        for name, label in (("ffmpeg", self.ffmpeg_status), ("deno", self.deno_status)):
+            path = find_tool(name)
+            label.setText(f"✔  {path}" if path else f"✖  {tr('tool_missing')}")
+        self.tools_button.setEnabled(not self.tools_busy)
+        self.tools_download_button.setEnabled(bool(missing_tools()) and not self.tools_busy)
+
+    def on_download_tools_clicked(self):
+        names = missing_tools()
+        if self.tools_busy or not names:
+            return
+        self.tools_busy = True
+        self.refresh_tools_status()
+
+        # In the background: it downloads tens of megabytes
+        worker = Worker(install_tools, self.tools_folder, names, with_progress=True)
+        worker.signals.progress.connect(self.on_tools_progress)
+        worker.signals.finished.connect(self.on_tools_installed)
+        worker.signals.failed.connect(self.on_tools_failed)
+        self.tools_worker = worker
+        self.pool.start(worker)
+
+    def on_tools_progress(self, progress):
+        self.status_label.setText(tr(
+            "status_tools_downloading",
+            tool=TOOL_LABELS[progress.tool], percent=int(progress.fraction * 100),
+        ))
+
+    def on_tools_installed(self, installed):
+        self.tools_busy = False
+        add_to_path(self.tools_folder)         # the programs we start (yt-dlp) will find them too
+        self.downloader.refresh_tools()        # look for FFmpeg again
+        self.check_tools()
+        self.status_label.setText(tr("status_tools_done"))
+
+    def on_tools_failed(self, error):
+        self.tools_busy = False
+        self.refresh_tools_status()
+        text = error_text(error)
+        self.status_label.setText(tr("status_tools_failed", error=text))
+        self.warn(text)
+        
     def on_update_clicked(self):
         self.update_button.setEnabled(False)
         self.status_label.setText(tr("status_checking_updates"))

@@ -1,0 +1,1 @@
+APP_VERSION = "1.0.0"     # one place: the Settings tab and the installer both read it

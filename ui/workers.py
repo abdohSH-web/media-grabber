@@ -9,7 +9,7 @@ from grabber.errors import GrabberError, UserCancelledError
 class WorkerSignals(QObject):
     """A Worker can't emit signals itself (it isn't a QObject), so it owns this."""
     finished = Signal(object)    # carries the result
-    failed = Signal(str)         # carries an error message
+    failed = Signal(object)      # carries the ERROR OBJECT (the UI decides the wording)
     progress = Signal(object)    # carries a Progress object
     cancelled = Signal()         # the user cancelled: no message needed
 
@@ -33,20 +33,18 @@ class Worker(QRunnable):
         try:
             kwargs = dict(self.kwargs)
             if self.with_progress:
-                # emit() sends the signal. Passing it as on_progress means:
-                # "report progress through the signal"
                 kwargs["on_progress"] = self.signals.progress.emit
             result = self.function(*self.args, **kwargs)
         except UserCancelledError:
             self.signals.cancelled.emit()        # BEFORE GrabberError: it is a subclass
         except GrabberError as e:
-            # Errors we raise on purpose: the message is already user-friendly
-            self.signals.failed.emit(str(e))
+            self.signals.failed.emit(e)
         except Exception as e:
             # Last line of defence: a bug in a thread would otherwise vanish silently.
-            # We show it AND print the full traceback in the terminal for debugging.
             traceback.print_exc()
-            self.signals.failed.emit(f"Unexpected error: {e}")
+            self.signals.failed.emit(
+                GrabberError(f"Unexpected error: {e}", code="unexpected", reason=str(e))
+            )
         else:
             self.signals.finished.emit(result)
 
@@ -62,8 +60,9 @@ def load_thumbnail(url):
     except Exception:
         return None
 
+
 class QueueBridge(QObject):
-    """The queue runs in a plain Python thread and knows nothing about Qt.
+    """The queue runs in plain Python threads and knows nothing about Qt.
     This tiny object turns its callback into a Qt signal, which Qt delivers
     safely in the main thread."""
     changed = Signal(object)

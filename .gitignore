@@ -9,3 +9,4 @@ dist/
 *.spec
 tools_bin/
 .pytest_cache/
+installer_output/
