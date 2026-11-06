@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
@@ -22,6 +23,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QRadioButton,
+    QScrollArea,
     QSpinBox,
     QStyle,
     QSystemTrayIcon,
@@ -460,17 +462,29 @@ class MainWindow(QMainWindow):
         return page
 
     def build_settings_tab(self):
-        page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.setSpacing(14)
-        layout.setContentsMargins(20, 20, 20, 20)
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setSpacing(16)
+        layout.setContentsMargins(24, 20, 24, 20)
+
+        def new_form(group, grow=False):
+            """The same comfortable spacing for every group."""
+            form = QFormLayout(group)
+            form.setHorizontalSpacing(18)
+            form.setVerticalSpacing(12)
+            form.setLabelAlignment(Qt.AlignmentFlag.AlignLeading | Qt.AlignmentFlag.AlignVCenter)
+            policy = (QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow if grow
+                      else QFormLayout.FieldGrowthPolicy.FieldsStayAtSizeHint)
+            form.setFieldGrowthPolicy(policy)
+            return form
 
         # --- Appearance: theme and language ---
         appearance = QGroupBox()
         self.bind(appearance.setTitle, "grp_appearance")
-        form = QFormLayout(appearance)
+        form = new_form(appearance)
 
         self.theme_box = QComboBox()
+        self.theme_box.setMinimumWidth(220)
         for _key, value in THEME_CHOICES:
             self.theme_box.addItem("", value)
         self.bind_items(self.theme_box, [key for key, _value in THEME_CHOICES])
@@ -480,6 +494,7 @@ class MainWindow(QMainWindow):
         form.addRow(self.label("lbl_theme"), self.theme_box)
 
         self.language_box = QComboBox()
+        self.language_box.setMinimumWidth(220)
         for code, name in LANGUAGES:                    # each language is named in ITS OWN language
             self.language_box.addItem(name, code)
         self.language_box.setCurrentIndex(max(self.language_box.findData(current_language()), 0))
@@ -490,8 +505,9 @@ class MainWindow(QMainWindow):
         # --- Downloads ---
         downloads = QGroupBox()
         self.bind(downloads.setTitle, "grp_downloads")
-        form = QFormLayout(downloads)
+        form = new_form(downloads)
         self.parallel_spin = QSpinBox()
+        self.parallel_spin.setMinimumWidth(90)
         self.parallel_spin.setRange(1, MAX_PARALLEL)
         self.parallel_spin.setValue(self.settings.value("downloads/parallel", 1, type=int))
         self.parallel_spin.valueChanged.connect(self.on_parallel_changed)
@@ -504,7 +520,7 @@ class MainWindow(QMainWindow):
         # --- Notifications ---
         notifications = QGroupBox()
         self.bind(notifications.setTitle, "grp_notifications")
-        form = QFormLayout(notifications)
+        form = new_form(notifications)
         self.notify_check = self.check("chk_notify")
         self.notify_check.setChecked(self.settings.value("ui/notify", True, type=bool))
         self.notify_check.toggled.connect(lambda checked: self.settings.setValue("ui/notify", checked))
@@ -522,12 +538,16 @@ class MainWindow(QMainWindow):
         row.addWidget(self.version_label, stretch=1)
         row.addWidget(self.update_button)
         layout.addWidget(updates)
+
         # --- Required tools ---
         tools = QGroupBox()
         self.bind(tools.setTitle, "grp_tools")
-        form = QFormLayout(tools)
+        form = new_form(tools, grow=True)
         self.ffmpeg_status = QLabel()
         self.deno_status = QLabel()
+        for status in (self.ffmpeg_status, self.deno_status):
+            status.setWordWrap(True)                    # a long path wraps instead of being cut
+            status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         form.addRow("FFmpeg", self.ffmpeg_status)
         form.addRow("Deno", self.deno_status)
         self.tools_download_button = self.button("btn_download_tools")
@@ -539,9 +559,15 @@ class MainWindow(QMainWindow):
         about.setObjectName("muted")
         self.bind(about.setText, "lbl_about", version=APP_VERSION)
         layout.addWidget(about)
-        
+
         layout.addStretch()
-        return page
+
+        # The page scrolls when the window is short, instead of squeezing everything
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(content)
+        return scroll
 
     # ============================================================
     # Settings handlers

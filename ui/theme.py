@@ -57,7 +57,7 @@ QStatusBar QLabel { color: $text_muted; }
 
 QLineEdit, QComboBox, QSpinBox {
     background-color: $surface; border: 1px solid $border;
-    border-radius: 6px; padding: 6px 8px; selection-background-color: $accent;
+    border-radius: 6px; padding: 6px 8px; selection-background-color: $accent; min-height: 20px;
 }
 QLineEdit:focus, QComboBox:focus, QSpinBox:focus { border: 1px solid $accent; }
 QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled { color: $text_muted; }
@@ -68,7 +68,7 @@ QComboBox QAbstractItemView {
 
 QPushButton {
     background-color: $surface_light; border: 1px solid $border;
-    border-radius: 6px; padding: 7px 14px;
+    border-radius: 6px; padding: 7px 14px; min-height: 20px;
 }
 QPushButton:hover { background-color: $border; }
 QPushButton:pressed { background-color: $surface; }
@@ -137,7 +137,15 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 QScrollBar:horizontal { background: $surface; height: 12px; margin: 0; }
 QScrollBar::handle:horizontal { background: $border; border-radius: 6px; min-width: 24px; }
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
-""")
+QScrollArea { border: none; }
+
+/* ---------- Sliders (the video preview) ---------- */
+QSlider::groove:horizontal { height: 6px; background: $border; border-radius: 3px; }
+QSlider::sub-page:horizontal { background: $accent; border-radius: 3px; }
+QSlider::handle:horizontal {
+    background: $surface; border: 3px solid $accent;
+    width: 12px; height: 12px; margin: -6px 0; border-radius: 9px;
+}""")
 
 
 def current_colors():
