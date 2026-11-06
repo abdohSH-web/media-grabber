@@ -122,6 +122,25 @@ def _existed_before(path, started):
     except OSError:
         return False
 
+def _pick_preview(info):
+    """A direct link to a small version with picture AND sound, for the preview player.
+    Returns "" if there isn't one."""
+    candidates = []
+    for f in info.get("formats") or []:
+        has_picture = f.get("vcodec") not in (None, "none")
+        has_sound = f.get("acodec") not in (None, "none")
+        playable = f.get("protocol") in ("https", "http", "m3u8", "m3u8_native")
+        if has_picture and has_sound and playable and f.get("url"):
+            candidates.append(f)
+    if not candidates:
+        return ""
+
+    small = [f for f in candidates if (f.get("height") or 0) <= 480]
+    if small:
+        best = max(small, key=lambda f: f.get("height") or 0)      # the biggest of the small ones
+    else:
+        best = min(candidates, key=lambda f: f.get("height") or 9999)   # all big: the smallest
+    return best["url"]
 
 class Downloader:
     """Our own simple interface on top of yt-dlp.
@@ -202,6 +221,7 @@ class Downloader:
             entry_count=len(entries) if is_playlist else 1,
             heights=heights,
             entries=entries,
+            preview_url="" if is_playlist else _pick_preview(info),
         )
 
     # ------------------------------------------------------------

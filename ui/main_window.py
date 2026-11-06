@@ -53,6 +53,7 @@ from .parsing import parse_languages
 from .playlist_dialog import PlaylistDialog
 from .theme import apply_theme
 from .workers import QueueBridge, Worker, load_thumbnail
+from .preview_dialog import PreviewDialog
 
 # Quality choices offered for playlists (each video has its own list of heights)
 PRESET_HEIGHTS = (1080, 720, 480, 360)
@@ -309,6 +310,10 @@ class MainWindow(QMainWindow):
         text_column.addWidget(self.title_label)
         text_column.addWidget(self.meta_label)
         text_column.addWidget(self.choose_button, alignment=Qt.AlignmentFlag.AlignLeft)
+        self.preview_button = self.button("btn_preview")
+        self.preview_button.setVisible(False)           # only when a preview stream exists
+        self.preview_button.clicked.connect(self.on_preview_clicked)
+        text_column.addWidget(self.preview_button, alignment=Qt.AlignmentFlag.AlignLeading)
         text_column.addStretch()
 
         card.addWidget(self.thumbnail_label)
@@ -734,6 +739,7 @@ class MainWindow(QMainWindow):
         self.clip_range = None                 # a new video: the old range means nothing
         self.clip_check.setChecked(False)
         self.choose_button.setVisible(False)
+        self.preview_button.setVisible(False)
         self.refresh_title()
         self.meta_label.setText("")
         self.show_thumbnail(None)
@@ -758,6 +764,7 @@ class MainWindow(QMainWindow):
         self.selected_items = None             # None = all videos of the playlist
         self.show_thumbnail(thumbnail_bytes)
         self.choose_button.setVisible(info.is_playlist)
+        self.preview_button.setVisible(bool(info.preview_url))
         self.refresh_title()
         self.refresh_meta()
 
@@ -801,6 +808,12 @@ class MainWindow(QMainWindow):
         self.selected_items = None if len(chosen) == len(self.info.entries) else chosen
         self.refresh_meta()
 
+    def on_preview_clicked(self):
+        if self.info is None or not self.info.preview_url:
+            self.warn(tr("preview_unavailable"))
+            return
+        PreviewDialog(self.info.preview_url, self.info.url, parent=self).exec()
+
     # ---------- download only a part ----------
     def on_clip_toggled(self, checked):
         self.update_extra_options()
@@ -815,7 +828,10 @@ class MainWindow(QMainWindow):
             return
 
         start, end = self.clip_range if self.clip_range else (None, None)
-        dialog = ClipDialog(self.info.duration_seconds, start, end, self)
+        dialog = ClipDialog(
+            self.info.duration_seconds, start, end, self,
+            preview_url=self.info.preview_url, page_url=self.info.url,
+        )
         if dialog.exec() == QDialog.DialogCode.Accepted:
             start, end = dialog.selected_range()
             # (None, None) = the whole video = nothing to clip

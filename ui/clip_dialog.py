@@ -12,12 +12,13 @@ from .formatting import format_duration
 from .i18n import tr
 from .parsing import parse_time
 from .range_slider import RangeSlider
+from .preview_dialog import PreviewDialog
 
 
 class ClipDialog(QDialog):
     """Pick the part of a video to download: drag the two handles, or type the times."""
 
-    def __init__(self, duration, start=None, end=None, parent=None):
+    def __init__(self, duration, start=None, end=None, parent=None, preview_url="", page_url=""):
         super().__init__(parent)
         self.setWindowTitle(tr("dlg_clip_title"))
         self.resize(580, 270)
@@ -45,6 +46,12 @@ class ClipDialog(QDialog):
 
         whole_button = QPushButton(tr("btn_whole_video"))
         whole_button.clicked.connect(self.use_whole_video)
+        self.preview_url = preview_url
+        self.page_url = page_url
+        if preview_url:                          # no stream = no button
+            preview_button = QPushButton(tr("btn_preview_part"))
+            preview_button.clicked.connect(self.preview_part)
+            layout.addWidget(preview_button)
         layout.addWidget(whole_button)
 
         buttons = QDialogButtonBox(
@@ -85,6 +92,12 @@ class ClipDialog(QDialog):
     def use_whole_video(self):
         self.slider.set_range(0, self.duration)
         self.show_range(self.slider.start, self.slider.end)
+
+    def preview_part(self):
+        """Play only the selected part, so the user sees what they are about to download."""
+        PreviewDialog(
+            self.preview_url, self.page_url, self.slider.start, self.slider.end, self
+        ).exec()
 
     def selected_range(self):
         """(start, end) in seconds. end is None for "until the end".

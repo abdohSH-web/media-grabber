@@ -33,6 +33,7 @@ class MediaInfo:
     entry_count: int
     heights: tuple[int, ...] = ()                  # available video heights, e.g. (1080, 720)
     entries: tuple[PlaylistEntry, ...] = ()        # the videos of a playlist
+    preview_url: str = ""                        # a direct link to a small playable version
 
 
 @dataclass(frozen=True)

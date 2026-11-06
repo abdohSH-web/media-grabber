@@ -160,6 +160,14 @@ TRANSLATIONS = {
         "lbl_to": "To",
         "clip_summary": "Selected: {start} → {end}   ({length} long)",
         "btn_whole_video": "Use the whole video",
+
+        "btn_preview": "Preview",
+        "btn_preview_part": "Preview this part",
+        "btn_open_browser": "Open in browser",
+        "dlg_preview_title": "Preview",
+        "preview_loading": "Loading the preview...",
+        "preview_failed": "The preview couldn't be played. You can open the video in your browser instead.",
+        "preview_unavailable": "No preview is available for this video.",
     },
     "ar": {
         "tab_download": "تنزيل",
@@ -318,5 +326,13 @@ TRANSLATIONS = {
         "lbl_to": "إلى",
         "clip_summary": "المحدد: من {start} إلى {end}   (المدة {length})",
         "btn_whole_video": "استخدام الفيديو كاملاً",
+
+        "btn_preview": "معاينة",
+        "btn_preview_part": "معاينة هذا الجزء",
+        "btn_open_browser": "فتح في المتصفح",
+        "dlg_preview_title": "المعاينة",
+        "preview_loading": "جارٍ تحميل المعاينة...",
+        "preview_failed": "تعذّر تشغيل المعاينة. يمكنك فتح الفيديو في المتصفح بدلاً من ذلك.",
+        "preview_unavailable": "لا تتوفر معاينة لهذا الفيديو.",
     },
 }
