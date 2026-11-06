@@ -86,7 +86,7 @@ The queue is tested without any internet: a fake downloader stands in for the re
 
 | Study Summary | Calories |
 |---|---|
-| ![Study Summary](screenshots/study_summary.png) | ![Calories](screenshots/calories.png) |
+| ![Study Summary](screenshots/study_summary.png) | ![Calories](screenshots/calories.png) | 
 
 ## Disclaimer
 
